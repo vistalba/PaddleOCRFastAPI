@@ -1,7 +1,5 @@
 # -*- coding: utf-8 -*-
 
-import os
-from pathlib import Path
 from typing import Any
 
 import requests
@@ -10,106 +8,25 @@ from fastapi import APIRouter, Form, HTTPException, UploadFile, status
 from models.OCRModel import *
 from models.RestfulModel import *
 from utils.ImageHelper import base64_to_ndarray, bytes_to_ndarray
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_PDX_CACHE_HOME = PROJECT_ROOT / ".paddlex"
-os.environ.setdefault("PADDLE_PDX_CACHE_HOME", str(DEFAULT_PDX_CACHE_HOME))
-os.environ.setdefault("PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT", "0")
-
-from paddleocr import DocPreprocessor, PaddleOCR
-
-OCR_LANGUAGE = os.environ.get("OCR_LANGUAGE", "ch")
-OCR_MODEL_DIR = Path(
-    os.environ.get("OCR_MODEL_DIR", str(PROJECT_ROOT / ".paddleocr"))
-).expanduser().resolve()
-
-DEFAULT_MODEL_DIRS = {
-    "text_detection_model_dir": OCR_MODEL_DIR / "ch_PP-OCRv4_det_infer",
-    "text_recognition_model_dir": OCR_MODEL_DIR / "ch_PP-OCRv4_rec_infer",
-    "textline_orientation_model_dir": OCR_MODEL_DIR / "ch_ppocr_mobile_v2.0_cls_infer",
-}
+from utils.ocr_runtime import build_doc_preprocessor, build_ocr
 
 router = APIRouter(prefix="/ocr", tags=["OCR"])
 
-_ocr_instance: PaddleOCR | None = None
-_doc_preprocessor: DocPreprocessor | None = None
+_ocr_instance: Any | None = None
+_doc_preprocessor: Any | None = None
 
 
-def _resolve_model_dir(env_name: str, default_dir: Path) -> Path:
-    configured_dir = os.environ.get(env_name)
-    if configured_dir:
-        return Path(configured_dir).expanduser().resolve()
-    return default_dir
-
-
-def _build_ocr() -> PaddleOCR:
-    OCR_MODEL_DIR.mkdir(parents=True, exist_ok=True)
-
-    model_dirs = {
-        name: _resolve_model_dir(env_name, default_dir)
-        for name, env_name, default_dir in (
-            (
-                "text_detection_model_dir",
-                "OCR_TEXT_DETECTION_MODEL_DIR",
-                DEFAULT_MODEL_DIRS["text_detection_model_dir"],
-            ),
-            (
-                "text_recognition_model_dir",
-                "OCR_TEXT_RECOGNITION_MODEL_DIR",
-                DEFAULT_MODEL_DIRS["text_recognition_model_dir"],
-            ),
-            (
-                "textline_orientation_model_dir",
-                "OCR_TEXTLINE_ORIENTATION_MODEL_DIR",
-                DEFAULT_MODEL_DIRS["textline_orientation_model_dir"],
-            ),
-        )
-    }
-
-    has_explicit_model_dirs = any(
-        os.environ.get(env_name)
-        for env_name in (
-            "OCR_TEXT_DETECTION_MODEL_DIR",
-            "OCR_TEXT_RECOGNITION_MODEL_DIR",
-            "OCR_TEXTLINE_ORIENTATION_MODEL_DIR",
-        )
-    )
-    has_local_chinese_models = OCR_LANGUAGE == "ch" and all(
-        model_dir.exists() for model_dir in model_dirs.values()
-    )
-
-    if has_explicit_model_dirs or has_local_chinese_models:
-        return PaddleOCR(
-            use_doc_orientation_classify=False,
-            use_doc_unwarping=False,
-            use_textline_orientation=True,
-            text_detection_model_dir=str(model_dirs["text_detection_model_dir"]),
-            text_recognition_model_dir=str(model_dirs["text_recognition_model_dir"]),
-            textline_orientation_model_dir=str(model_dirs["textline_orientation_model_dir"]),
-        )
-
-    return PaddleOCR(
-        use_angle_cls=True,
-        use_doc_orientation_classify=False,
-        use_doc_unwarping=False,
-        lang=OCR_LANGUAGE,
-    )
-
-
-def _get_ocr() -> PaddleOCR:
+def _get_ocr():
     global _ocr_instance
     if _ocr_instance is None:
-        _ocr_instance = _build_ocr()
+        _ocr_instance = build_ocr()
     return _ocr_instance
 
 
-def _get_doc_preprocessor() -> DocPreprocessor:
+def _get_doc_preprocessor():
     global _doc_preprocessor
     if _doc_preprocessor is None:
-        _doc_preprocessor = DocPreprocessor(
-            use_doc_orientation_classify=True,
-            use_doc_unwarping=True,
-        )
+        _doc_preprocessor = build_doc_preprocessor()
     return _doc_preprocessor
 
 
@@ -145,7 +62,7 @@ def _run_ocr(image: Any, use_doc_preprocessor: bool = False):
         ocr_input, doc_preprocessor_meta = _preprocess_image(image)
         ocr_image_variant = "corrected"
 
-    results = _get_ocr().ocr(ocr_input)
+    results = _get_ocr().predict(ocr_input)
     serialized = [result.json.get("res", result.json) for result in results]
 
     for item in serialized:

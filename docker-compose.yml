@@ -1,16 +1,21 @@
-# version: "3"
-
 services:
 
   PaddleOCR:
-    build: . 
+    build:
+      context: .
+      args:
+        OCR_MODEL_TIER: small
     container_name: paddle_ocr_api # 自定义容器名
-    image: paddleocrfastapi:latest # 第2步自定义的镜像名与标签
+    image: paddleocrfastapi:latest # 自定义镜像名与标签
     environment:
       - TZ=Asia/Hong_Kong
-      - OCR_LANGUAGE=ch
-      - OCR_MODEL_DIR=/app/.paddleocr
+      - OCR_MODEL_TIER=small
+      - OCR_DEVICE=cpu
+      - OCR_MODEL_DIR=/app/.paddlex/official_models
       - PADDLE_PDX_CACHE_HOME=/app/.paddlex
+      - PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True
+      - PADDLE_PDX_MODEL_SOURCE=bos
+      - PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT=0
     ports:
-    - "8000:8000" # 自定义服务暴露端口, 8000为FastAPI默认端口, 不做修改,只能改前面的8000,不要忘了引号
+      - "8000:8000" # 自定义服务暴露端口，8000 为 FastAPI 默认端口
     restart: unless-stopped

@@ -1,0 +1,13 @@
+.git/
+.venv/
+__pycache__/
+*.py[cod]
+.DS_Store
+.env
+.paddleocr/
+pp-ocrv4/
+uploads/
+ocr_tasks.db
+
+# Keep .paddlex/ in the Docker build context so preloaded PP-OCRv6 models can
+# be copied into the image for offline runtime.

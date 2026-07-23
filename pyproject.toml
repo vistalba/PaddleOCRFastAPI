@@ -7,8 +7,9 @@ requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.135.1",
     "numpy==2.3.4",
-    "paddleocr>=3.4.0",
-    "paddlepaddle>=3.3.0",
+    "paddleocr==3.7.0",
+    "paddlepaddle==3.3.0; sys_platform != 'win32'",
+    "paddlepaddle-gpu==3.3.0; sys_platform == 'win32'",
     "python-multipart>=0.0.22",
     "pyyaml>=6.0.2",
     "requests>=2.32.5",
@@ -24,3 +25,11 @@ dependencies = [
 [[tool.uv.index]]
 url = "https://pypi.tuna.tsinghua.edu.cn/simple"
 default = true
+
+[[tool.uv.index]]
+name = "paddle-gpu-cu118"
+url = "https://www.paddlepaddle.org.cn/packages/stable/cu118/"
+explicit = true
+
+[tool.uv.sources]
+paddlepaddle-gpu = { index = "paddle-gpu-cu118" }
