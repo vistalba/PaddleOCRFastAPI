@@ -13,6 +13,7 @@ import numpy as np
 import pypdfium2 as pdfium
 
 from config import (
+    MAX_MULTI_IMAGE_PAGES,
     MAX_PDF_PAGES,
     PDF_MAX_RENDER_PIXELS,
     PDF_NATIVE_TEXT_MIN_CHARS,
@@ -224,3 +225,41 @@ def prepare_document_file(source_path: str) -> dict[str, Any]:
         else _prepare_image(path)
     )
     return {"file_type": file_type, "pages": pages}
+
+
+def prepare_document_files(source_paths: list[str]) -> dict[str, Any]:
+    """Prepare an ordered group of images as one multi-page task."""
+    if not source_paths:
+        raise DocumentPreparationError("多页任务不包含图片")
+    if len(source_paths) > MAX_MULTI_IMAGE_PAGES:
+        raise DocumentPreparationError(
+            f"多页任务共 {len(source_paths)} 张图片，"
+            f"超过最大限制 {MAX_MULTI_IMAGE_PAGES} 张"
+        )
+    if len(source_paths) == 1:
+        return prepare_document_file(source_paths[0])
+
+    pages = []
+    for page_index, source_path in enumerate(source_paths):
+        path = Path(source_path)
+        if path.suffix.lower() == ".pdf":
+            raise DocumentPreparationError("多页图片模式暂不支持 PDF")
+        try:
+            page = _prepare_image(path)[0]
+            page["page_index"] = page_index
+            pages.append(page)
+        except DocumentPreparationError as exc:
+            pages.append(
+                {
+                    "page_index": page_index,
+                    "processing_method": "ocr",
+                    "original_image_path": None,
+                    "native_text": None,
+                    "width": None,
+                    "height": None,
+                    "preparation_error": (
+                        f"第 {page_index + 1} 张图片处理失败：{exc}"
+                    ),
+                }
+            )
+    return {"file_type": "image", "pages": pages}

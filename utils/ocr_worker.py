@@ -11,7 +11,7 @@ from typing import Any
 import cv2
 
 from utils.ocr_runtime import build_doc_preprocessor, build_ocr
-from utils.document_processor import prepare_document_file
+from utils.document_processor import prepare_document_file, prepare_document_files
 
 _ocr_instances = {}
 _doc_preprocessor = None

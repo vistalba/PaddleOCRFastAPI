@@ -8,11 +8,22 @@ import re
 import shutil
 import uuid
 from concurrent.futures import ProcessPoolExecutor
-from datetime import datetime
+from concurrent.futures.process import BrokenProcessPool
+from datetime import datetime, timedelta, timezone
+from math import ceil
 from pathlib import Path
 from typing import Any, List, Optional
 
-from fastapi import APIRouter, Depends, Form, HTTPException, Request, UploadFile, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Request,
+    UploadFile,
+    status,
+)
 from fastapi.responses import FileResponse
 from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, Field
@@ -20,22 +31,29 @@ from sqlalchemy.orm import Session
 
 from config import (
     MAX_CONCURRENT_OCR,
+    MAX_MULTI_IMAGE_PAGES,
     MAX_UPLOAD_SIZE_MB,
     RATE_LIMIT,
+    RETRY_COOLDOWN_SECONDS,
     UPLOAD_DIR,
 )
 from database import SessionLocal, get_db
 from limiter import get_client_ip, limiter
 from models.TaskModel import Task, TaskPage
-from utils.ocr_worker import prepare_document_file, run_ocr_file
+from utils.ocr_worker import (
+    prepare_document_file,
+    prepare_document_files,
+    run_ocr_file,
+)
 
 logger = logging.getLogger(__name__)
 
 # OCR 模型与 PDF 渲染均在进程池中执行，避免阻塞 FastAPI 事件循环。
 _ocr_pool = ProcessPoolExecutor(max_workers=MAX_CONCURRENT_OCR)
+_ocr_pool_lock = asyncio.Lock()
 
-# 一个队列任务始终对应一个上传文件；文件内部可以包含多个页面。
-_task_queue: asyncio.Queue[tuple[str, Path]] = asyncio.Queue()
+# 一个队列任务对应一个有序输入集合：单图/PDF 为 1 个路径，多图为 N 个路径。
+_task_queue: asyncio.Queue[tuple[str, tuple[Path, ...]]] = asyncio.Queue()
 _worker_tasks: list[asyncio.Task] = []
 
 router = APIRouter(prefix="/ocr", tags=["Tasks"])
@@ -51,6 +69,7 @@ ALLOWED_IMAGE_EXTENSIONS = {
 }
 ALLOWED_EXTENSIONS = ALLOWED_IMAGE_EXTENSIONS | {".pdf"}
 UPLOAD_CHUNK_SIZE = 1024 * 1024
+RETRY_STATE_FILENAME = "retry_state.json"
 
 
 # ── Response schemas ──────────────────────────────────────────────────────────
@@ -99,6 +118,8 @@ class TaskDetailResponse(BaseModel):
     ocr_result: Optional[Any]
     error_msg: Optional[str]
     queue_position: Optional[int] = None
+    retry_available_at: Optional[datetime] = None
+    retry_after_seconds: int = 0
 
 
 class TaskListResponse(BaseModel):
@@ -109,6 +130,11 @@ class TaskListResponse(BaseModel):
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _utcnow() -> datetime:
+    """Return naive UTC to match the existing SQLite datetime columns."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
 
 def _sanitize_ip(ip: str) -> str:
     return re.sub(r"[^a-zA-Z0-9]", "_", ip)
@@ -121,9 +147,19 @@ def _task_dir(ip: str, task_id: str) -> Path:
     return folder
 
 
-def _task_source_file(task_dir: Path) -> Optional[Path]:
+def _task_source_files(task_dir: Path) -> list[Path]:
+    multi_image_sources = sorted(
+        task_dir.glob("sources/page_*/original.*")
+    )
+    if multi_image_sources:
+        return multi_image_sources
     candidates = sorted(task_dir.glob("original.*"))
-    return candidates[0] if candidates else None
+    return candidates[:1]
+
+
+def _task_source_file(task_dir: Path) -> Optional[Path]:
+    sources = _task_source_files(task_dir)
+    return sources[0] if sources else None
 
 
 def _task_file_type(task: Task) -> str:
@@ -138,6 +174,82 @@ def _parse_json(value: Optional[str]) -> Optional[Any]:
         return json.loads(value)
     except json.JSONDecodeError:
         return value
+
+
+def _retry_state_path(task: Task) -> Optional[Path]:
+    if not task.file_dir:
+        return None
+    return Path(task.file_dir) / RETRY_STATE_FILENAME
+
+
+def _write_retry_state(
+    task: Task,
+    available_at: Optional[datetime] = None,
+) -> Optional[datetime]:
+    state_path = _retry_state_path(task)
+    if state_path is None:
+        return None
+    retry_available_at = available_at or (
+        _utcnow()
+        + timedelta(seconds=max(0, RETRY_COOLDOWN_SECONDS))
+    )
+    state_path.write_text(
+        json.dumps(
+            {"retry_available_at": retry_available_at.isoformat()},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    return retry_available_at
+
+
+def _read_retry_available_at(task: Task) -> Optional[datetime]:
+    state_path = _retry_state_path(task)
+    if state_path is not None and state_path.is_file():
+        try:
+            payload = json.loads(state_path.read_text(encoding="utf-8"))
+            value = payload.get("retry_available_at")
+            if isinstance(value, str):
+                return datetime.fromisoformat(value)
+        except (OSError, ValueError, json.JSONDecodeError):
+            logger.warning(
+                "无法读取任务重试状态，task_id=%s",
+                task.task_id,
+            )
+
+    # 兼容升级前已经失败的任务：从 manifest 修改时间推算冷却期。
+    if task.file_dir:
+        manifest_path = Path(task.file_dir) / "manifest.json"
+        if manifest_path.is_file():
+            return (
+                datetime.fromtimestamp(
+                    manifest_path.stat().st_mtime,
+                    timezone.utc,
+                ).replace(tzinfo=None)
+                + timedelta(seconds=max(0, RETRY_COOLDOWN_SECONDS))
+            )
+    return (task.created_at or _utcnow()) + timedelta(
+        seconds=max(0, RETRY_COOLDOWN_SECONDS)
+    )
+
+
+def _retry_after_seconds(task: Task) -> tuple[Optional[datetime], int]:
+    if task.status != "failed":
+        return None, 0
+    available_at = _read_retry_available_at(task)
+    if available_at is None:
+        return None, 0
+    remaining = max(
+        0,
+        ceil((available_at - _utcnow()).total_seconds()),
+    )
+    return available_at, remaining
+
+
+def _clear_retry_state(task: Task) -> None:
+    state_path = _retry_state_path(task)
+    if state_path is not None:
+        state_path.unlink(missing_ok=True)
 
 
 def _legacy_task_image_files(task_dir: Path) -> dict[str, Optional[Path]]:
@@ -317,6 +429,7 @@ def _build_task_response(
     )
     completed_pages = sum(page.status == "done" for page in pages)
     failed_pages = sum(page.status == "failed" for page in pages)
+    retry_available_at, retry_after_seconds = _retry_after_seconds(task)
     return TaskDetailResponse(
         task_id=task.task_id,
         ip=task.ip,
@@ -341,11 +454,22 @@ def _build_task_response(
         ),
         error_msg=task.error_msg,
         queue_position=queue_position,
+        retry_available_at=retry_available_at,
+        retry_after_seconds=retry_after_seconds,
     )
 
 
-async def _save_upload_file(file: UploadFile, output_path: Path) -> int:
-    max_bytes = MAX_UPLOAD_SIZE_MB * 1024 * 1024
+async def _save_upload_file(
+    file: UploadFile,
+    output_path: Path,
+    max_bytes: Optional[int] = None,
+    limit_label: str = "文件大小",
+) -> int:
+    byte_limit = (
+        max_bytes
+        if max_bytes is not None
+        else MAX_UPLOAD_SIZE_MB * 1024 * 1024
+    )
     total = 0
     with output_path.open("wb") as output:
         while True:
@@ -353,10 +477,12 @@ async def _save_upload_file(file: UploadFile, output_path: Path) -> int:
             if not chunk:
                 break
             total += len(chunk)
-            if total > max_bytes:
+            if total > byte_limit:
                 raise HTTPException(
                     status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                    detail=f"文件大小超过 {MAX_UPLOAD_SIZE_MB} MB 限制",
+                    detail=(
+                        f"{limit_label}超过 {MAX_UPLOAD_SIZE_MB} MB 限制"
+                    ),
                 )
             output.write(chunk)
 
@@ -432,13 +558,42 @@ def _write_manifest(task: Task, pages: list[TaskPage]) -> None:
     )
 
 
+async def _run_in_ocr_pool(function, *args):
+    """Run work in the OCR pool and replace a pool whose child has died."""
+    global _ocr_pool
+
+    active_pool = _ocr_pool
+    loop = asyncio.get_running_loop()
+    try:
+        return await loop.run_in_executor(
+            active_pool,
+            function,
+            *args,
+        )
+    except BrokenProcessPool:
+        async with _ocr_pool_lock:
+            if _ocr_pool is active_pool:
+                try:
+                    active_pool.shutdown(
+                        wait=False,
+                        cancel_futures=True,
+                    )
+                except Exception:
+                    logger.exception("释放已损坏 OCR 进程池失败")
+                _ocr_pool = ProcessPoolExecutor(
+                    max_workers=MAX_CONCURRENT_OCR
+                )
+                logger.error("OCR 子进程异常退出，已重建进程池")
+        raise
+
+
 # ── Queue workers ─────────────────────────────────────────────────────────────
 
 async def _ocr_queue_worker() -> None:
     while True:
-        task_id, source_path = await _task_queue.get()
+        task_id, source_paths = await _task_queue.get()
         try:
-            await _process_ocr_async(task_id, source_path)
+            await _process_ocr_async(task_id, source_paths)
         except Exception:
             logger.exception("OCR worker 遇到未捕获异常，task_id=%s", task_id)
         finally:
@@ -461,12 +616,12 @@ async def start_workers() -> None:
         for task in stuck:
             if not task.file_dir:
                 continue
-            source_path = _task_source_file(Path(task.file_dir))
-            if source_path is None:
+            source_paths = _task_source_files(Path(task.file_dir))
+            if not source_paths:
                 continue
             task.status = "queued"
             db.commit()
-            await _task_queue.put((task.task_id, source_path))
+            await _task_queue.put((task.task_id, tuple(source_paths)))
             logger.info("崩溃恢复：重新入队 task_id=%s", task.task_id)
     finally:
         db.close()
@@ -528,7 +683,10 @@ def _upsert_task_pages(
     )
 
 
-async def _process_ocr_async(task_id: str, source_path: Path) -> None:
+async def _process_ocr_async(
+    task_id: str,
+    source_paths: Path | tuple[Path, ...] | list[Path],
+) -> None:
     db = SessionLocal()
     try:
         task: Task = db.query(Task).filter(Task.task_id == task_id).first()
@@ -539,12 +697,21 @@ async def _process_ocr_async(task_id: str, source_path: Path) -> None:
         task.error_msg = None
         db.commit()
 
-        loop = asyncio.get_running_loop()
-        prepared = await loop.run_in_executor(
-            _ocr_pool,
-            prepare_document_file,
-            str(source_path),
+        normalized_sources = (
+            [source_paths]
+            if isinstance(source_paths, Path)
+            else list(source_paths)
         )
+        if len(normalized_sources) == 1:
+            prepared = await _run_in_ocr_pool(
+                prepare_document_file,
+                str(normalized_sources[0]),
+            )
+        else:
+            prepared = await _run_in_ocr_pool(
+                prepare_document_files,
+                [str(path) for path in normalized_sources],
+            )
         pages = _upsert_task_pages(db, task, prepared["pages"])
 
         successful_pages = 0
@@ -565,8 +732,7 @@ async def _process_ocr_async(task_id: str, source_path: Path) -> None:
                     page.corrected_image_path = None
                     page.ocr_result = None
                 else:
-                    worker_payload = await loop.run_in_executor(
-                        _ocr_pool,
+                    worker_payload = await _run_in_ocr_pool(
                         run_ocr_file,
                         str(page.original_image_path),
                         use_doc_preprocessor,
@@ -610,9 +776,11 @@ async def _process_ocr_async(task_id: str, source_path: Path) -> None:
                 if failed_pages > 0
                 else None
             )
+            _clear_retry_state(task)
         else:
             task.status = "failed"
             task.error_msg = "所有页面均处理失败"
+            _write_retry_state(task)
         db.commit()
 
         refreshed_pages = (
@@ -629,6 +797,7 @@ async def _process_ocr_async(task_id: str, source_path: Path) -> None:
         if task:
             task.status = "failed"
             task.error_msg = str(exc)
+            _write_retry_state(task)
             db.commit()
             pages = (
                 db.query(TaskPage)
@@ -683,7 +852,7 @@ async def create_task(
     task = Task(
         task_id=task_id,
         ip=ip,
-        created_at=datetime.utcnow(),
+        created_at=_utcnow(),
         status="queued",
         original_filename=file.filename,
         file_dir=str(task_dir),
@@ -692,7 +861,197 @@ async def create_task(
     db.add(task)
     db.commit()
 
-    await _task_queue.put((task_id, source_path))
+    await _task_queue.put((task_id, (source_path,)))
+    return TaskCreateResponse(task_id=task_id, status="queued")
+
+
+@router.post(
+    "/tasks/multi-image",
+    response_model=TaskCreateResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="创建多图片 OCR 任务（上传顺序即页面顺序）",
+)
+@limiter.limit(RATE_LIMIT)
+async def create_multi_image_task(
+    request: Request,
+    files: List[UploadFile] = File(...),
+    use_doc_preprocessor: bool = Form(False),
+    db: Session = Depends(get_db),
+):
+    if not files:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="请至少上传一张图片",
+        )
+    if len(files) > MAX_MULTI_IMAGE_PAGES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"一次最多上传 {MAX_MULTI_IMAGE_PAGES} 张图片"
+            ),
+        )
+
+    task_dir: Optional[Path] = None
+    source_paths: list[Path] = []
+    original_names: list[str] = []
+    try:
+        suffixes = []
+        for file in files:
+            filename = file.filename or ""
+            suffix = Path(filename).suffix.lower()
+            if suffix not in ALLOWED_IMAGE_EXTENSIONS:
+                supported = ", ".join(
+                    sorted(ALLOWED_IMAGE_EXTENSIONS)
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=(
+                        "多页模式仅支持图片，不支持 PDF；"
+                        f"请上传: {supported}"
+                    ),
+                )
+            suffixes.append(suffix)
+            original_names.append(filename)
+
+        ip = get_client_ip(request)
+        task_id = str(uuid.uuid4())
+        task_dir = _task_dir(ip, task_id)
+        remaining_bytes = MAX_UPLOAD_SIZE_MB * 1024 * 1024
+
+        for page_index, (file, suffix) in enumerate(
+            zip(files, suffixes)
+        ):
+            page_dir = (
+                task_dir
+                / "sources"
+                / f"page_{page_index + 1:04d}"
+            )
+            page_dir.mkdir(parents=True, exist_ok=True)
+            source_path = page_dir / f"original{suffix}"
+            written = await _save_upload_file(
+                file,
+                source_path,
+                max_bytes=remaining_bytes,
+                limit_label="多页任务文件总大小",
+            )
+            remaining_bytes -= written
+            _validate_uploaded_file(source_path, suffix)
+            source_paths.append(source_path)
+    except Exception:
+        if task_dir is not None and task_dir.exists():
+            shutil.rmtree(task_dir)
+        raise
+    finally:
+        await asyncio.gather(
+            *(file.close() for file in files),
+            return_exceptions=True,
+        )
+
+    display_name = (
+        original_names[0]
+        if len(original_names) == 1
+        else f"{original_names[0]} 等 {len(original_names)} 张图片"
+    )
+    task = Task(
+        task_id=task_id,
+        ip=ip,
+        created_at=_utcnow(),
+        status="queued",
+        original_filename=display_name,
+        file_dir=str(task_dir),
+        use_doc_preprocessor=use_doc_preprocessor,
+    )
+    try:
+        db.add(task)
+        db.commit()
+    except Exception:
+        db.rollback()
+        if task_dir.exists():
+            shutil.rmtree(task_dir)
+        raise
+
+    await _task_queue.put((task_id, tuple(source_paths)))
+    return TaskCreateResponse(task_id=task_id, status="queued")
+
+
+def _reset_failed_task_for_retry(
+    db: Session,
+    task: Task,
+) -> tuple[Path, ...]:
+    if task.status != "failed":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="只有失败任务可以重试",
+        )
+
+    _, retry_after_seconds = _retry_after_seconds(task)
+    if retry_after_seconds > 0:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"请在 {retry_after_seconds} 秒后重试",
+            headers={
+                "Retry-After": str(retry_after_seconds),
+            },
+        )
+
+    if not task.file_dir:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="任务原文件不存在，无法重试",
+        )
+    source_paths = tuple(_task_source_files(Path(task.file_dir)))
+    if not source_paths:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="任务原文件不存在，无法重试",
+        )
+
+    task.status = "queued"
+    task.error_msg = None
+    task.ocr_result = None
+    pages = (
+        db.query(TaskPage)
+        .filter(TaskPage.task_id == task.task_id)
+        .order_by(TaskPage.page_index)
+        .all()
+    )
+    for page in pages:
+        page.status = "queued"
+        page.error_msg = None
+        page.ocr_result = None
+        page.corrected_image_path = None
+
+    db.commit()
+    _clear_retry_state(task)
+    _write_manifest(task, pages)
+    return source_paths
+
+
+@router.post(
+    "/tasks/{task_id}/retry",
+    response_model=TaskCreateResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="在冷却期结束后重试失败任务",
+)
+@limiter.limit(RATE_LIMIT)
+async def retry_task(
+    request: Request,
+    task_id: str,
+    db: Session = Depends(get_db),
+):
+    task: Task = (
+        db.query(Task)
+        .filter(Task.task_id == task_id)
+        .first()
+    )
+    if not task:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="任务不存在",
+        )
+
+    source_paths = _reset_failed_task_for_retry(db, task)
+    await _task_queue.put((task_id, source_paths))
     return TaskCreateResponse(task_id=task_id, status="queued")
 
 

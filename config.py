@@ -14,6 +14,10 @@ RATE_LIMIT: str = os.getenv("RATE_LIMIT", "10/minute")
 MAX_CONCURRENT_OCR: int = int(os.getenv("MAX_CONCURRENT_OCR", "1"))
 MAX_UPLOAD_SIZE_MB: int = int(os.getenv("MAX_UPLOAD_SIZE_MB", "50"))
 MAX_PDF_PAGES: int = int(os.getenv("MAX_PDF_PAGES", "50"))
+MAX_MULTI_IMAGE_PAGES: int = int(os.getenv("MAX_MULTI_IMAGE_PAGES", "50"))
+RETRY_COOLDOWN_SECONDS: int = int(
+    os.getenv("RETRY_COOLDOWN_SECONDS", "60")
+)
 PDF_RENDER_SCALE: float = float(os.getenv("PDF_RENDER_SCALE", "2.0"))
 PDF_MAX_RENDER_PIXELS: int = int(
     os.getenv("PDF_MAX_RENDER_PIXELS", "40000000")

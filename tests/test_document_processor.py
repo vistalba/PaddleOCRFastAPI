@@ -11,6 +11,7 @@ from utils.document_processor import (
     meaningful_text_char_count,
     normalize_pdf_text,
     prepare_document_file,
+    prepare_document_files,
     should_use_native_pdf_text,
 )
 
@@ -187,6 +188,42 @@ class DocumentProcessorTests(unittest.TestCase):
             self.assertEqual(result["pages"][0]["processing_method"], "ocr")
             self.assertEqual(result["pages"][0]["width"], 120)
             self.assertEqual(result["pages"][0]["height"], 80)
+
+    def test_prepare_multiple_images_keeps_upload_order(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            first = root / "first.png"
+            second = root / "second.png"
+            Image.new("RGB", (120, 80), "red").save(first)
+            Image.new("RGB", (90, 140), "blue").save(second)
+
+            result = prepare_document_files(
+                [str(second), str(first)]
+            )
+
+            self.assertEqual(result["file_type"], "image")
+            self.assertEqual(
+                [page["page_index"] for page in result["pages"]],
+                [0, 1],
+            )
+            self.assertEqual(
+                [Path(page["original_image_path"]).name for page in result["pages"]],
+                ["second.png", "first.png"],
+            )
+            self.assertEqual(
+                [(page["width"], page["height"]) for page in result["pages"]],
+                [(90, 140), (120, 80)],
+            )
+
+            with patch(
+                "utils.document_processor.MAX_MULTI_IMAGE_PAGES",
+                1,
+            ):
+                with self.assertRaisesRegex(
+                    DocumentPreparationError,
+                    "超过最大限制 1 张",
+                ):
+                    prepare_document_files([str(first), str(second)])
 
     def test_pdf_page_limit_and_malformed_pdf(self):
         with tempfile.TemporaryDirectory() as temp_dir:

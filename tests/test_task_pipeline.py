@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -249,6 +250,93 @@ class TaskPipelineTests(unittest.TestCase):
         finally:
             db.close()
 
+    def test_multi_image_sources_become_ordered_task_pages(self):
+        task_dir = self.root / "multi-image"
+        first_source_dir = task_dir / "sources" / "page_0001"
+        second_source_dir = task_dir / "sources" / "page_0002"
+        first_source_dir.mkdir(parents=True)
+        second_source_dir.mkdir(parents=True)
+        first_source = first_source_dir / "original.png"
+        second_source = second_source_dir / "original.jpg"
+        Image.new("RGB", (90, 140), "blue").save(first_source)
+        Image.new("RGB", (120, 80), "red").save(second_source)
+
+        db = self.session_factory()
+        db.add(
+            Task(
+                task_id="multi-image-task",
+                ip="127.0.0.1",
+                status="queued",
+                original_filename="first.png 等 2 张图片",
+                file_dir=str(task_dir),
+            )
+        )
+        db.commit()
+        db.close()
+
+        def fake_ocr(image_path, _use_doc_preprocessor):
+            page_name = Path(image_path).parent.name
+            return {
+                "ocr_result": [
+                    {
+                        "input_path": None,
+                        "rec_texts": [page_name],
+                        "rec_scores": [0.99],
+                        "rec_polys": [
+                            [[0, 0], [20, 0], [20, 10], [0, 10]]
+                        ],
+                        "rec_boxes": [[0, 0, 20, 10]],
+                        "ocr_image_variant": "original",
+                    }
+                ],
+                "ocr_image_variant": "original",
+                "corrected_image_path": None,
+            }
+
+        test_pool = ThreadPoolExecutor(max_workers=1)
+        try:
+            with (
+                patch.object(tasks, "SessionLocal", self.session_factory),
+                patch.object(tasks, "_ocr_pool", test_pool),
+                patch.object(tasks, "run_ocr_file", fake_ocr),
+            ):
+                source_paths = tasks._task_source_files(task_dir)
+                self.assertEqual(source_paths, [first_source, second_source])
+                asyncio.run(
+                    tasks._process_ocr_async(
+                        "multi-image-task",
+                        tuple(source_paths),
+                    )
+                )
+        finally:
+            test_pool.shutdown(wait=True)
+
+        db = self.session_factory()
+        try:
+            task = (
+                db.query(Task)
+                .filter(Task.task_id == "multi-image-task")
+                .one()
+            )
+            response = tasks._build_task_response(db, task)
+            self.assertEqual(task.status, "done")
+            self.assertEqual(response.page_count, 2)
+            self.assertEqual(response.completed_pages, 2)
+            self.assertEqual(
+                [(page.width, page.height) for page in response.pages],
+                [(90, 140), (120, 80)],
+            )
+            self.assertEqual(
+                response.pages[0].ocr_result[0]["rec_texts"],
+                ["page_0001"],
+            )
+            self.assertEqual(
+                response.pages[1].ocr_result[0]["rec_texts"],
+                ["page_0002"],
+            )
+        finally:
+            db.close()
+
     def test_upload_size_and_file_signature_validation(self):
         oversized = UploadFile(
             filename="oversized.png",
@@ -301,6 +389,112 @@ class TaskPipelineTests(unittest.TestCase):
                 db.commit()
         finally:
             db.rollback()
+            db.close()
+
+    def test_failed_task_cooldown_and_retry(self):
+        task_dir = self.root / "retry"
+        task_dir.mkdir()
+        source_path = task_dir / "original.png"
+        Image.new("RGB", (120, 80), "white").save(source_path)
+
+        db = self.session_factory()
+        task = Task(
+            task_id="retry-task",
+            ip="127.0.0.1",
+            status="failed",
+            original_filename="retry.png",
+            file_dir=str(task_dir),
+            error_msg="temporary failure",
+        )
+        db.add(task)
+        db.commit()
+
+        with patch.object(tasks, "RETRY_COOLDOWN_SECONDS", 60):
+            tasks._write_retry_state(
+                task,
+                datetime.now(timezone.utc).replace(tzinfo=None)
+                + timedelta(seconds=60),
+            )
+            response = tasks._build_task_response(db, task)
+            self.assertGreater(response.retry_after_seconds, 0)
+            self.assertLessEqual(response.retry_after_seconds, 60)
+            self.assertIsNotNone(response.retry_available_at)
+
+            with self.assertRaises(HTTPException) as cooldown_error:
+                tasks._reset_failed_task_for_retry(db, task)
+            self.assertEqual(cooldown_error.exception.status_code, 429)
+            self.assertIn(
+                "Retry-After",
+                cooldown_error.exception.headers,
+            )
+
+            tasks._write_retry_state(
+                task,
+                datetime.now(timezone.utc).replace(tzinfo=None)
+                - timedelta(seconds=1),
+            )
+            source_paths = tasks._reset_failed_task_for_retry(db, task)
+
+        self.assertEqual(source_paths, (source_path,))
+        self.assertEqual(task.status, "queued")
+        self.assertIsNone(task.error_msg)
+        self.assertFalse(
+            (task_dir / tasks.RETRY_STATE_FILENAME).exists()
+        )
+        db.close()
+
+        def fake_ocr(_image_path, _use_doc_preprocessor):
+            return {
+                "ocr_result": [
+                    {
+                        "input_path": None,
+                        "rec_texts": ["retried"],
+                        "rec_scores": [0.99],
+                        "rec_polys": [
+                            [[0, 0], [20, 0], [20, 10], [0, 10]]
+                        ],
+                        "rec_boxes": [[0, 0, 20, 10]],
+                        "ocr_image_variant": "original",
+                    }
+                ],
+                "ocr_image_variant": "original",
+                "corrected_image_path": None,
+            }
+
+        test_pool = ThreadPoolExecutor(max_workers=1)
+        try:
+            with (
+                patch.object(tasks, "SessionLocal", self.session_factory),
+                patch.object(tasks, "_ocr_pool", test_pool),
+                patch.object(tasks, "run_ocr_file", fake_ocr),
+            ):
+                asyncio.run(
+                    tasks._process_ocr_async(
+                        "retry-task",
+                        source_paths,
+                    )
+                )
+        finally:
+            test_pool.shutdown(wait=True)
+
+        db = self.session_factory()
+        try:
+            retried_task = (
+                db.query(Task)
+                .filter(Task.task_id == "retry-task")
+                .one()
+            )
+            retried_response = tasks._build_task_response(
+                db,
+                retried_task,
+            )
+            self.assertEqual(retried_task.status, "done")
+            self.assertEqual(
+                retried_response.pages[0].ocr_result[0]["rec_texts"],
+                ["retried"],
+            )
+            self.assertEqual(retried_response.retry_after_seconds, 0)
+        finally:
             db.close()
 
 

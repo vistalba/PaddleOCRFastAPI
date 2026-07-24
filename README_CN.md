@@ -15,8 +15,10 @@
 - [x] Base64 数据识别
 - [x] 上传文件识别
 - [x] 单个 PDF 多页识别
+- [x] 多张图片按自定义顺序组成一个任务
 - [x] PDF 原生文本页与扫描页自动分流
 - [x] 异步任务逐页结果、页面图片与部分失败
+- [x] 失败任务冷却后复用原文件重试
 
 ## 图片与 PDF 任务
 
@@ -28,15 +30,28 @@
 - 其余 PDF 页面渲染为 PNG 后执行 PP-OCRv6。
 - `GET /ocr/tasks/{task_id}` 的 `pages` 字段返回逐页状态与结果。
 - `GET /ocr/tasks/{task_id}/pages/{page_index}/image` 返回指定页图。
+- 完全失败的任务可在冷却结束后通过
+  `POST /ocr/tasks/{task_id}/retry` 复用原文件重新执行；服务端会返回
+  `retry_after_seconds` 并强制校验冷却时间。
+
+多图片任务使用 `POST /ocr/tasks/multi-image`：
+
+- multipart 字段名为重复的 `files`，上传顺序即页面顺序。
+- 仅接收图片，不接收 PDF；单个 PDF 继续使用 `/ocr/tasks`。
+- 所有图片共享任务上传大小限制，单次最多上传
+  `MAX_MULTI_IMAGE_PAGES` 张。
+- 文档透视矫正设置会逐页作用于该任务中的图片。
 
 相关限制可在 `.env` 中调整：
 
 ```dotenv
 MAX_UPLOAD_SIZE_MB=50
 MAX_PDF_PAGES=50
+MAX_MULTI_IMAGE_PAGES=50
 PDF_RENDER_SCALE=2.0
 PDF_MAX_RENDER_PIXELS=40000000
 PDF_NATIVE_TEXT_MIN_CHARS=20
+RETRY_COOLDOWN_SECONDS=60
 ```
 
 完整设计与实施进度见

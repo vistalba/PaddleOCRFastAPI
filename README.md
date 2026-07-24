@@ -19,8 +19,10 @@ A Paddle OCR Web API based on `FastAPI`.
 - [x] Base64 data recognition
 - [x] Upload file recognition
 - [x] Single-file, multi-page PDF recognition
+- [x] Ordered multi-image tasks
 - [x] Per-page native PDF text or OCR routing
 - [x] Per-page task results, page images, and partial failure handling
+- [x] Retry failed tasks with a server-enforced cooldown
 
 ## Image and PDF Tasks
 
@@ -32,15 +34,29 @@ A Paddle OCR Web API based on `FastAPI`.
 - Other pages are rendered to PNG and processed with PP-OCRv6.
 - `GET /ocr/tasks/{task_id}` returns per-page state and results in `pages`.
 - `GET /ocr/tasks/{task_id}/pages/{page_index}/image` returns a page image.
+- Fully failed tasks can reuse their original files through
+  `POST /ocr/tasks/{task_id}/retry` after the cooldown. The task response exposes
+  `retry_after_seconds`, and the server enforces the wait period.
+
+Use `POST /ocr/tasks/multi-image` for an ordered multi-image task:
+
+- Send images as repeated multipart `files` fields; upload order is page order.
+- This endpoint accepts images only. Continue to send a single PDF to
+  `/ocr/tasks`.
+- All images share the task upload-size limit, and the task accepts up to
+  `MAX_MULTI_IMAGE_PAGES` images.
+- Document preprocessing, when enabled, is applied to each image page.
 
 The limits are configurable in `.env`:
 
 ```dotenv
 MAX_UPLOAD_SIZE_MB=50
 MAX_PDF_PAGES=50
+MAX_MULTI_IMAGE_PAGES=50
 PDF_RENDER_SCALE=2.0
 PDF_MAX_RENDER_PIXELS=40000000
 PDF_NATIVE_TEXT_MIN_CHARS=20
+RETRY_COOLDOWN_SECONDS=60
 ```
 
 See
