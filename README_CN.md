@@ -230,14 +230,14 @@ AI 推理使用 `llama-cpp-python`，支持包含聊天模板的自定义 GGUF �
 
    ```text
    local_models/
-   └─ Qwen3-0.6B-Q4_K_M.gguf
+   └─ Qwen3-0.6B-Q8_0.gguf
    ```
 
 3. 在 `.env` 中配置：
 
    ```dotenv
-   AI_TEXT_MODEL_PATH=local_models/Qwen3-0.6B-Q4_K_M.gguf
-   AI_TEXT_MODEL_NAME=Qwen3-0.6B-Q4_K_M
+   AI_TEXT_MODEL_PATH=local_models/Qwen3-0.6B-Q8_0.gguf
+   AI_TEXT_MODEL_NAME=Qwen3-0.6B-Q8_0
    AI_TEXT_MODEL_CONTEXT_SIZE=4096
    AI_TEXT_MODEL_THREADS=4
    AI_TEXT_MODEL_GPU_LAYERS=0
@@ -246,6 +246,8 @@ AI 推理使用 `llama-cpp-python`，支持包含聊天模板的自定义 GGUF �
 `AI_TEXT_MODEL_PATH` 未配置、文件不存在或没有安装可选依赖时，AI 按钮会显示
 不可用，但不会影响 OCR 与坐标规则分段。相对路径以 FastAPI 启动目录为基准。
 服务只维护一份常驻模型实例，AI 请求按顺序执行，避免并发重复加载模型。
+内置提示词会为 Qwen3 添加 `/no_think`，并通过 JSON Schema 和行号完整性
+校验限制模型只能决定相邻行的分组，不能改写 OCR 原文。
 
 Docker 部署时还需把 `docker-compose.yml` 中的
 `build.args.INSTALL_AI` 改为 `true`，取消 AI 模型路径和

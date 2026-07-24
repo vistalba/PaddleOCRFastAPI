@@ -18,7 +18,7 @@ services:
       - PADDLE_PDX_MODEL_SOURCE=bos
       - PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT=0
       # 将 build.args.INSTALL_AI 改为 true 并挂载 GGUF 后取消下面两行注释。
-      # - AI_TEXT_MODEL_PATH=/app/local_models/Qwen3-0.6B-Q4_K_M.gguf
+      # - AI_TEXT_MODEL_PATH=/app/local_models/Qwen3-0.6B-Q8_0.gguf
       # - AI_TEXT_MODEL_THREADS=4
     # volumes:
     #   - ./local_models:/app/local_models:ro

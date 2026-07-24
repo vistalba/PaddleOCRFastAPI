@@ -2,6 +2,8 @@ __pycache__/
 test.py
 .paddlex/
 .python-version
+.env
+.DS_Store
 uploads/
 ocr_tasks.db
 tmp/
