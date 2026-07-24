@@ -13,6 +13,7 @@ from PIL import Image
 from sqlalchemy import create_engine
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
+from starlette.requests import Request
 
 from database import Base
 from models.TaskModel import Task, TaskPage
@@ -496,6 +497,89 @@ class TaskPipelineTests(unittest.TestCase):
             self.assertEqual(retried_response.retry_after_seconds, 0)
         finally:
             db.close()
+
+    def test_delete_finished_task_removes_database_rows_and_files(self):
+        task_dir = self.root / "deletable-task"
+        task_dir.mkdir()
+        (task_dir / "original.png").write_bytes(b"task data")
+
+        db = self.session_factory()
+        db.add(
+            Task(
+                task_id="deletable-task",
+                ip="127.0.0.1",
+                status="done",
+                original_filename="delete.png",
+                file_dir=str(task_dir),
+                pages=[
+                    TaskPage(
+                        page_index=0,
+                        status="done",
+                        processing_method="ocr",
+                    )
+                ],
+            )
+        )
+        db.commit()
+
+        request = Request({
+            "type": "http",
+            "method": "DELETE",
+            "path": "/ocr/tasks/deletable-task",
+            "headers": [],
+            "query_string": b"",
+            "client": ("127.0.0.1", 1234),
+            "server": ("testserver", 80),
+            "scheme": "http",
+        })
+        with patch.object(tasks, "UPLOAD_DIR", self.root):
+            tasks.delete_task(request, "deletable-task", db)
+
+        self.assertIsNone(
+            db.query(Task)
+            .filter(Task.task_id == "deletable-task")
+            .first()
+        )
+        self.assertEqual(
+            db.query(TaskPage)
+            .filter(TaskPage.task_id == "deletable-task")
+            .count(),
+            0,
+        )
+        self.assertFalse(task_dir.exists())
+        db.close()
+
+    def test_delete_rejects_active_task(self):
+        db = self.session_factory()
+        db.add(
+            Task(
+                task_id="active-task",
+                ip="127.0.0.1",
+                status="processing",
+            )
+        )
+        db.commit()
+
+        request = Request({
+            "type": "http",
+            "method": "DELETE",
+            "path": "/ocr/tasks/active-task",
+            "headers": [],
+            "query_string": b"",
+            "client": ("127.0.0.1", 1234),
+            "server": ("testserver", 80),
+            "scheme": "http",
+        })
+        with self.assertRaises(HTTPException) as active_error:
+            tasks.delete_task(request, "active-task", db)
+
+        self.assertEqual(active_error.exception.status_code, 409)
+        self.assertIsNotNone(
+            db.query(Task)
+            .filter(Task.task_id == "active-task")
+            .first()
+        )
+        db.close()
 
 
 if __name__ == "__main__":

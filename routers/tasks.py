@@ -252,6 +252,26 @@ def _clear_retry_state(task: Task) -> None:
         state_path.unlink(missing_ok=True)
 
 
+def _remove_task_files(file_dir: Optional[str]) -> None:
+    if not file_dir:
+        return
+
+    upload_root = UPLOAD_DIR.resolve()
+    task_dir = Path(file_dir).resolve()
+    try:
+        task_dir.relative_to(upload_root)
+    except ValueError:
+        logger.error("拒绝删除上传目录之外的任务文件：%s", task_dir)
+        return
+
+    if task_dir == upload_root:
+        logger.error("拒绝删除上传根目录：%s", task_dir)
+        return
+
+    if task_dir.is_dir():
+        shutil.rmtree(task_dir)
+
+
 def _legacy_task_image_files(task_dir: Path) -> dict[str, Optional[Path]]:
     original_path = _task_source_file(task_dir)
     corrected_path = task_dir / "corrected.png"
@@ -1078,6 +1098,42 @@ def get_task(task_id: str, db: Session = Depends(get_db)):
         queue_position = ahead + 1
 
     return _build_task_response(db, task, queue_position)
+
+
+@router.delete(
+    "/tasks/{task_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="删除已结束的 OCR 任务及其保存文件",
+)
+def delete_task(
+    request: Request,
+    task_id: str,
+    db: Session = Depends(get_db),
+):
+    ip = get_client_ip(request)
+    task: Task = (
+        db.query(Task)
+        .filter(Task.task_id == task_id, Task.ip == ip)
+        .first()
+    )
+    if not task:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="任务不存在",
+        )
+    if task.status not in {"done", "failed"}:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="任务正在处理，完成后才能删除",
+        )
+
+    file_dir = task.file_dir
+    db.delete(task)
+    db.commit()
+    try:
+        _remove_task_files(file_dir)
+    except OSError:
+        logger.exception("清理任务文件失败，task_id=%s", task_id)
 
 
 def _serve_image_file(image_file: Path) -> FileResponse:
