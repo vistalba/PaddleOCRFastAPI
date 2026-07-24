@@ -11,6 +11,7 @@ from typing import Any
 import cv2
 
 from utils.ocr_runtime import build_doc_preprocessor, build_ocr
+from utils.document_processor import prepare_document_file
 
 _ocr_instances = {}
 _doc_preprocessor = None
@@ -90,6 +91,7 @@ def run_ocr_file(image_path: str, use_doc_preprocessor: bool = False) -> dict[st
     serialized = [result.json.get("res", result.json) for result in results]
 
     for item in serialized:
+        item["input_path"] = None
         model_settings = item.setdefault("model_settings", {})
         model_settings["use_doc_preprocessor"] = use_doc_preprocessor
         item["ocr_image_variant"] = ocr_image_variant

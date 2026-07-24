@@ -14,6 +14,33 @@
 - [x] 局域网范围内路径图片 OCR 识别
 - [x] Base64 数据识别
 - [x] 上传文件识别
+- [x] 单个 PDF 多页识别
+- [x] PDF 原生文本页与扫描页自动分流
+- [x] 异步任务逐页结果、页面图片与部分失败
+
+## 图片与 PDF 任务
+
+异步接口 `POST /ocr/tasks` 保持单文件上传：
+
+- 上传图片时，任务包含 1 页并执行 PP-OCRv6。
+- 上传 PDF 时，任务包含 PDF 的全部页面。
+- PDF 页面存在足够原生文本时直接使用文本层。
+- 其余 PDF 页面渲染为 PNG 后执行 PP-OCRv6。
+- `GET /ocr/tasks/{task_id}` 的 `pages` 字段返回逐页状态与结果。
+- `GET /ocr/tasks/{task_id}/pages/{page_index}/image` 返回指定页图。
+
+相关限制可在 `.env` 中调整：
+
+```dotenv
+MAX_UPLOAD_SIZE_MB=50
+MAX_PDF_PAGES=50
+PDF_RENDER_SCALE=2.0
+PDF_MAX_RENDER_PIXELS=40000000
+PDF_NATIVE_TEXT_MIN_CHARS=20
+```
+
+完整设计与实施进度见
+[docs/PDF_MULTIPAGE_IMPLEMENTATION_PLAN.md](docs/PDF_MULTIPAGE_IMPLEMENTATION_PLAN.md)。
 
 ## 部署方式
 

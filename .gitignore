@@ -4,3 +4,4 @@ test.py
 .python-version
 uploads/
 ocr_tasks.db
+tmp/

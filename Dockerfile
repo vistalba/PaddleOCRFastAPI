@@ -36,4 +36,4 @@ COPY . /app
 
 RUN uv run --no-sync python -m scripts.prepare_models --with-doc-preprocessor
 
-CMD ["uv", "run", "--no-sync", "uvicorn", "main:app", "--host", "0.0.0.0", "--workers", "2", "--log-config", "./log_conf.yaml"]
+CMD ["uv", "run", "--no-sync", "uvicorn", "main:app", "--host", "0.0.0.0", "--workers", "1", "--log-config", "./log_conf.yaml"]

@@ -18,6 +18,34 @@ A Paddle OCR Web API based on `FastAPI`.
 - [x] Local path image recognition
 - [x] Base64 data recognition
 - [x] Upload file recognition
+- [x] Single-file, multi-page PDF recognition
+- [x] Per-page native PDF text or OCR routing
+- [x] Per-page task results, page images, and partial failure handling
+
+## Image and PDF Tasks
+
+`POST /ocr/tasks` remains a single-file upload endpoint:
+
+- An image creates a one-page PP-OCRv6 task.
+- A PDF creates one task containing all PDF pages.
+- Pages with sufficient native PDF text use the text layer directly.
+- Other pages are rendered to PNG and processed with PP-OCRv6.
+- `GET /ocr/tasks/{task_id}` returns per-page state and results in `pages`.
+- `GET /ocr/tasks/{task_id}/pages/{page_index}/image` returns a page image.
+
+The limits are configurable in `.env`:
+
+```dotenv
+MAX_UPLOAD_SIZE_MB=50
+MAX_PDF_PAGES=50
+PDF_RENDER_SCALE=2.0
+PDF_MAX_RENDER_PIXELS=40000000
+PDF_NATIVE_TEXT_MIN_CHARS=20
+```
+
+See
+[docs/PDF_MULTIPAGE_IMPLEMENTATION_PLAN.md](docs/PDF_MULTIPAGE_IMPLEMENTATION_PLAN.md)
+for the detailed design and progress checklist.
 
 ## Deployment
 

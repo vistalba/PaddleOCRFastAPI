@@ -5,6 +5,7 @@ import json
 import logging
 import mimetypes
 import re
+import shutil
 import uuid
 from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
@@ -13,28 +14,43 @@ from typing import Any, List, Optional
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request, UploadFile, status
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from PIL import Image, UnidentifiedImageError
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from config import MAX_CONCURRENT_OCR, RATE_LIMIT, UPLOAD_DIR
+from config import (
+    MAX_CONCURRENT_OCR,
+    MAX_UPLOAD_SIZE_MB,
+    RATE_LIMIT,
+    UPLOAD_DIR,
+)
 from database import SessionLocal, get_db
 from limiter import get_client_ip, limiter
-from models.TaskModel import Task
-from utils.ocr_worker import run_ocr_file
+from models.TaskModel import Task, TaskPage
+from utils.ocr_worker import prepare_document_file, run_ocr_file
 
 logger = logging.getLogger(__name__)
 
-# 进程池：max_workers 与 MAX_CONCURRENT_OCR 保持一致
+# OCR 模型与 PDF 渲染均在进程池中执行，避免阻塞 FastAPI 事件循环。
 _ocr_pool = ProcessPoolExecutor(max_workers=MAX_CONCURRENT_OCR)
 
-# 应用层任务队列：存放 (task_id, image_path) 元组
+# 一个队列任务始终对应一个上传文件；文件内部可以包含多个页面。
 _task_queue: asyncio.Queue[tuple[str, Path]] = asyncio.Queue()
-# 长运行 worker 协程的 Task 句柄，用于 lifespan 关闭时取消
 _worker_tasks: list[asyncio.Task] = []
 
 router = APIRouter(prefix="/ocr", tags=["Tasks"])
 
-ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".tif"}
+ALLOWED_IMAGE_EXTENSIONS = {
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".bmp",
+    ".webp",
+    ".tiff",
+    ".tif",
+}
+ALLOWED_EXTENSIONS = ALLOWED_IMAGE_EXTENSIONS | {".pdf"}
+UPLOAD_CHUNK_SIZE = 1024 * 1024
 
 
 # ── Response schemas ──────────────────────────────────────────────────────────
@@ -49,19 +65,40 @@ class TaskImageVariants(BaseModel):
     corrected: Optional[str] = None
 
 
+class TaskPageResponse(BaseModel):
+    page_index: int
+    status: str
+    processing_method: str
+    width: Optional[int] = None
+    height: Optional[int] = None
+    image_variants: TaskImageVariants
+    default_image_variant: str = "original"
+    ocr_image_variant: str = "original"
+    native_text: Optional[str] = None
+    ocr_result: Optional[Any] = None
+    error_msg: Optional[str] = None
+
+
 class TaskDetailResponse(BaseModel):
     task_id: str
     ip: str
     created_at: datetime
     status: str
     original_filename: Optional[str]
+    file_type: str = "image"
     use_doc_preprocessor: bool = False
+    page_count: int = 0
+    completed_pages: int = 0
+    failed_pages: int = 0
+    pages: List[TaskPageResponse] = Field(default_factory=list)
+
+    # 第一页兼容字段，供旧前端或旧 API 调用方继续使用。
     image_variants: TaskImageVariants
     default_image_variant: str = "original"
     ocr_image_variant: str = "original"
     ocr_result: Optional[Any]
     error_msg: Optional[str]
-    queue_position: Optional[int] = None  # queued 时的排队位置（1-based）
+    queue_position: Optional[int] = None
 
 
 class TaskListResponse(BaseModel):
@@ -74,7 +111,6 @@ class TaskListResponse(BaseModel):
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _sanitize_ip(ip: str) -> str:
-    """将 IP 地址转换为安全的文件夹名称片段（替换非字母数字字符为下划线）。"""
     return re.sub(r"[^a-zA-Z0-9]", "_", ip)
 
 
@@ -85,83 +121,324 @@ def _task_dir(ip: str, task_id: str) -> Path:
     return folder
 
 
-def _task_image_files(task_dir: Path) -> dict[str, Optional[Path]]:
-    original_candidates = list(task_dir.glob("original.*"))
+def _task_source_file(task_dir: Path) -> Optional[Path]:
+    candidates = sorted(task_dir.glob("original.*"))
+    return candidates[0] if candidates else None
+
+
+def _task_file_type(task: Task) -> str:
+    filename = task.original_filename or ""
+    return "pdf" if Path(filename).suffix.lower() == ".pdf" else "image"
+
+
+def _parse_json(value: Optional[str]) -> Optional[Any]:
+    if not value:
+        return None
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return value
+
+
+def _legacy_task_image_files(task_dir: Path) -> dict[str, Optional[Path]]:
+    original_path = _task_source_file(task_dir)
     corrected_path = task_dir / "corrected.png"
     return {
-        "original": original_candidates[0] if original_candidates else None,
+        "original": original_path,
         "corrected": corrected_path if corrected_path.exists() else None,
     }
 
 
-def _build_image_variants(task_id: str, task_dir: Path) -> TaskImageVariants:
-    files = _task_image_files(task_dir)
-    return TaskImageVariants(
-        original=(
-            f"/ocr/tasks/{task_id}/image?variant=original"
-            if files["original"] is not None
-            else None
-        ),
-        corrected=(
-            f"/ocr/tasks/{task_id}/image?variant=corrected"
-            if files["corrected"] is not None
-            else None
-        ),
+def _page_image_files(page: TaskPage) -> dict[str, Optional[Path]]:
+    original_path = (
+        Path(page.original_image_path) if page.original_image_path else None
     )
+    corrected_path = (
+        Path(page.corrected_image_path) if page.corrected_image_path else None
+    )
+    return {
+        "original": (
+            original_path
+            if original_path is not None and original_path.exists()
+            else None
+        ),
+        "corrected": (
+            corrected_path
+            if corrected_path is not None and corrected_path.exists()
+            else None
+        ),
+    }
 
 
-def _resolve_ocr_image_variant(task: Task, ocr_result: Optional[Any]) -> str:
+def _resolve_result_image_variant(
+    ocr_result: Optional[Any],
+    corrected_exists: bool,
+    use_doc_preprocessor: bool,
+) -> str:
     if isinstance(ocr_result, list) and ocr_result:
         first_item = ocr_result[0]
         if isinstance(first_item, dict):
             variant = first_item.get("ocr_image_variant")
-            if isinstance(variant, str) and variant:
+            if variant in {"original", "corrected"}:
                 return variant
-    return "corrected" if bool(task.use_doc_preprocessor) else "original"
+    if corrected_exists and use_doc_preprocessor:
+        return "corrected"
+    return "original"
+
+
+def _build_page_image_variants(
+    task_id: str,
+    page_index: int,
+    image_files: dict[str, Optional[Path]],
+) -> TaskImageVariants:
+    base_url = f"/ocr/tasks/{task_id}/pages/{page_index}/image"
+    return TaskImageVariants(
+        original=(
+            f"{base_url}?variant=original"
+            if image_files["original"] is not None
+            else None
+        ),
+        corrected=(
+            f"{base_url}?variant=corrected"
+            if image_files["corrected"] is not None
+            else None
+        ),
+    )
+
+
+def _build_task_image_variants(
+    task_id: str,
+    image_files: dict[str, Optional[Path]],
+) -> TaskImageVariants:
+    return TaskImageVariants(
+        original=(
+            f"/ocr/tasks/{task_id}/image?variant=original"
+            if image_files["original"] is not None
+            else None
+        ),
+        corrected=(
+            f"/ocr/tasks/{task_id}/image?variant=corrected"
+            if image_files["corrected"] is not None
+            else None
+        ),
+    )
+
+
+def _build_page_response(
+    task: Task,
+    page: TaskPage,
+    include_result: bool,
+) -> TaskPageResponse:
+    ocr_result = _parse_json(page.ocr_result) if include_result else None
+    image_files = _page_image_files(page)
+    image_variants = _build_page_image_variants(
+        task.task_id, page.page_index, image_files
+    )
+    ocr_image_variant = _resolve_result_image_variant(
+        ocr_result,
+        corrected_exists=image_files["corrected"] is not None,
+        use_doc_preprocessor=bool(task.use_doc_preprocessor),
+    )
+    default_image_variant = (
+        "corrected" if image_files["corrected"] is not None else "original"
+    )
+    return TaskPageResponse(
+        page_index=page.page_index,
+        status=page.status,
+        processing_method=page.processing_method,
+        width=page.width,
+        height=page.height,
+        image_variants=image_variants,
+        default_image_variant=default_image_variant,
+        ocr_image_variant=ocr_image_variant,
+        native_text=page.native_text if include_result else None,
+        ocr_result=ocr_result,
+        error_msg=page.error_msg,
+    )
+
+
+def _build_legacy_page_response(
+    task: Task,
+    include_result: bool,
+) -> Optional[TaskPageResponse]:
+    if not task.file_dir or _task_file_type(task) == "pdf":
+        return None
+
+    task_dir = Path(task.file_dir)
+    image_files = _legacy_task_image_files(task_dir)
+    if image_files["original"] is None:
+        return None
+
+    ocr_result = _parse_json(task.ocr_result) if include_result else None
+    ocr_image_variant = _resolve_result_image_variant(
+        ocr_result,
+        corrected_exists=image_files["corrected"] is not None,
+        use_doc_preprocessor=bool(task.use_doc_preprocessor),
+    )
+    return TaskPageResponse(
+        page_index=0,
+        status=task.status,
+        processing_method="ocr",
+        image_variants=_build_task_image_variants(task.task_id, image_files),
+        default_image_variant=(
+            "corrected" if image_files["corrected"] is not None else "original"
+        ),
+        ocr_image_variant=ocr_image_variant,
+        ocr_result=ocr_result,
+        error_msg=task.error_msg,
+    )
 
 
 def _build_task_response(
+    db: Session,
     task: Task,
-    ocr_result: Optional[Any],
     queue_position: Optional[int] = None,
+    include_page_results: bool = True,
 ) -> TaskDetailResponse:
-    task_dir = Path(task.file_dir) if task.file_dir else None
-    image_variants = (
-        _build_image_variants(task.task_id, task_dir)
-        if task_dir is not None
-        else TaskImageVariants()
+    page_models = (
+        db.query(TaskPage)
+        .filter(TaskPage.task_id == task.task_id)
+        .order_by(TaskPage.page_index)
+        .all()
     )
-    ocr_image_variant = _resolve_ocr_image_variant(task, ocr_result)
-    default_image_variant = (
-        "corrected"
-        if bool(task.use_doc_preprocessor) and image_variants.corrected
-        else "original"
-    )
+    pages = [
+        _build_page_response(task, page, include_page_results)
+        for page in page_models
+    ]
 
+    if not pages:
+        legacy_page = _build_legacy_page_response(task, include_page_results)
+        if legacy_page is not None:
+            pages = [legacy_page]
+
+    first_page = pages[0] if pages else None
+    image_variants = (
+        first_page.image_variants if first_page else TaskImageVariants()
+    )
+    completed_pages = sum(page.status == "done" for page in pages)
+    failed_pages = sum(page.status == "failed" for page in pages)
     return TaskDetailResponse(
         task_id=task.task_id,
         ip=task.ip,
         created_at=task.created_at,
         status=task.status,
         original_filename=task.original_filename,
+        file_type=_task_file_type(task),
         use_doc_preprocessor=bool(task.use_doc_preprocessor),
+        page_count=len(pages),
+        completed_pages=completed_pages,
+        failed_pages=failed_pages,
+        pages=pages,
         image_variants=image_variants,
-        default_image_variant=default_image_variant,
-        ocr_image_variant=ocr_image_variant,
-        ocr_result=ocr_result,
+        default_image_variant=(
+            first_page.default_image_variant if first_page else "original"
+        ),
+        ocr_image_variant=(
+            first_page.ocr_image_variant if first_page else "original"
+        ),
+        ocr_result=(
+            _parse_json(task.ocr_result) if include_page_results else None
+        ),
         error_msg=task.error_msg,
         queue_position=queue_position,
+    )
+
+
+async def _save_upload_file(file: UploadFile, output_path: Path) -> int:
+    max_bytes = MAX_UPLOAD_SIZE_MB * 1024 * 1024
+    total = 0
+    with output_path.open("wb") as output:
+        while True:
+            chunk = await file.read(UPLOAD_CHUNK_SIZE)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise HTTPException(
+                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    detail=f"文件大小超过 {MAX_UPLOAD_SIZE_MB} MB 限制",
+                )
+            output.write(chunk)
+
+    if total == 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="上传文件为空",
+        )
+    return total
+
+
+def _validate_uploaded_file(path: Path, suffix: str) -> None:
+    if suffix == ".pdf":
+        with path.open("rb") as source:
+            header = source.read(1024)
+        if b"%PDF-" not in header:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="文件内容不是有效的 PDF",
+            )
+        return
+
+    try:
+        with Image.open(path) as image:
+            image.verify()
+    except (UnidentifiedImageError, OSError, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="文件内容不是有效的图片",
+        ) from exc
+
+
+def _write_page_result(page: TaskPage) -> None:
+    if not page.original_image_path:
+        return
+    result_path = Path(page.original_image_path).parent / "result.json"
+    payload = {
+        "page_index": page.page_index,
+        "processing_method": page.processing_method,
+        "native_text": page.native_text,
+        "ocr_result": _parse_json(page.ocr_result),
+        "error_msg": page.error_msg,
+    }
+    result_path.write_text(
+        json.dumps(payload, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def _write_manifest(task: Task, pages: list[TaskPage]) -> None:
+    if not task.file_dir:
+        return
+    payload = {
+        "task_id": task.task_id,
+        "file_type": _task_file_type(task),
+        "page_count": len(pages),
+        "status": task.status,
+        "pages": [
+            {
+                "page_index": page.page_index,
+                "status": page.status,
+                "processing_method": page.processing_method,
+                "width": page.width,
+                "height": page.height,
+                "error_msg": page.error_msg,
+            }
+            for page in pages
+        ],
+    }
+    (Path(task.file_dir) / "manifest.json").write_text(
+        json.dumps(payload, ensure_ascii=False),
+        encoding="utf-8",
     )
 
 
 # ── Queue workers ─────────────────────────────────────────────────────────────
 
 async def _ocr_queue_worker() -> None:
-    """长运行协程：从队列中取任务并依次处理。"""
     while True:
-        task_id, image_path = await _task_queue.get()
+        task_id, source_path = await _task_queue.get()
         try:
-            await _process_ocr_async(task_id, image_path)
+            await _process_ocr_async(task_id, source_path)
         except Exception:
             logger.exception("OCR worker 遇到未捕获异常，task_id=%s", task_id)
         finally:
@@ -169,12 +446,10 @@ async def _ocr_queue_worker() -> None:
 
 
 async def start_workers() -> None:
-    """启动 MAX_CONCURRENT_OCR 个 worker 协程，并将 DB 中残留的 queued 任务重新入队。"""
     for _ in range(MAX_CONCURRENT_OCR):
-        t = asyncio.create_task(_ocr_queue_worker())
-        _worker_tasks.append(t)
+        worker_task = asyncio.create_task(_ocr_queue_worker())
+        _worker_tasks.append(worker_task)
 
-    # 崩溃恢复：将上次运行中未完成的 queued/processing 任务重新入队
     db = SessionLocal()
     try:
         stuck = (
@@ -184,56 +459,169 @@ async def start_workers() -> None:
             .all()
         )
         for task in stuck:
-            if task.file_dir:
-                task_dir = Path(task.file_dir)
-                candidates = list(task_dir.glob("original.*"))
-                if candidates:
-                    task.status = "queued"  # 统一重置为 queued
-                    db.commit()
-                    await _task_queue.put((task.task_id, candidates[0]))
-                    logger.info("崩溃恢复：重新入队 task_id=%s", task.task_id)
+            if not task.file_dir:
+                continue
+            source_path = _task_source_file(Path(task.file_dir))
+            if source_path is None:
+                continue
+            task.status = "queued"
+            db.commit()
+            await _task_queue.put((task.task_id, source_path))
+            logger.info("崩溃恢复：重新入队 task_id=%s", task.task_id)
     finally:
         db.close()
 
 
 async def stop_workers() -> None:
-    """取消所有 worker 协程，等待队列排空。"""
-    for t in _worker_tasks:
-        t.cancel()
+    for worker_task in _worker_tasks:
+        worker_task.cancel()
     await asyncio.gather(*_worker_tasks, return_exceptions=True)
     _worker_tasks.clear()
 
 
-async def _process_ocr_async(task_id: str, image_path: Path) -> None:
-    """异步协程：将 queued 任务转为 processing 再送入进程池推理。"""
+def _upsert_task_pages(
+    db: Session,
+    task: Task,
+    prepared_pages: list[dict[str, Any]],
+) -> list[TaskPage]:
+    existing_pages = {
+        page.page_index: page
+        for page in (
+            db.query(TaskPage)
+            .filter(TaskPage.task_id == task.task_id)
+            .all()
+        )
+    }
+    valid_indexes = {item["page_index"] for item in prepared_pages}
+    for page_index, page in existing_pages.items():
+        if page_index not in valid_indexes:
+            db.delete(page)
+
+    pages = []
+    for item in prepared_pages:
+        page = existing_pages.get(item["page_index"])
+        if page is None:
+            page = TaskPage(
+                task_id=task.task_id,
+                page_index=item["page_index"],
+            )
+            db.add(page)
+
+        preparation_error = item.get("preparation_error")
+        page.status = "failed" if preparation_error else "queued"
+        page.processing_method = item["processing_method"]
+        page.width = item.get("width")
+        page.height = item.get("height")
+        page.original_image_path = item.get("original_image_path")
+        page.corrected_image_path = None
+        page.native_text = item.get("native_text")
+        page.ocr_result = None
+        page.error_msg = preparation_error
+        pages.append(page)
+
+    db.commit()
+    return (
+        db.query(TaskPage)
+        .filter(TaskPage.task_id == task.task_id)
+        .order_by(TaskPage.page_index)
+        .all()
+    )
+
+
+async def _process_ocr_async(task_id: str, source_path: Path) -> None:
     db = SessionLocal()
     try:
         task: Task = db.query(Task).filter(Task.task_id == task_id).first()
         if not task:
             return
 
-        use_doc_preprocessor = bool(task.use_doc_preprocessor)
-
         task.status = "processing"
+        task.error_msg = None
         db.commit()
 
-        # 将 CPU 密集的 OCR 推理送入独立进程，事件循环不阻塞
         loop = asyncio.get_running_loop()
-        worker_payload = await loop.run_in_executor(
+        prepared = await loop.run_in_executor(
             _ocr_pool,
-            run_ocr_file,
-            str(image_path),
-            use_doc_preprocessor,
+            prepare_document_file,
+            str(source_path),
         )
+        pages = _upsert_task_pages(db, task, prepared["pages"])
 
-        result_json = json.dumps(worker_payload["ocr_result"], ensure_ascii=False)
-        (image_path.parent / "result.json").write_text(result_json, encoding="utf-8")
+        successful_pages = 0
+        failed_pages = 0
+        first_page_ocr_result: Optional[list[Any]] = None
+        use_doc_preprocessor = bool(task.use_doc_preprocessor)
+
+        for page in pages:
+            if page.error_msg and not page.original_image_path:
+                failed_pages += 1
+                continue
+
+            page.status = "processing"
+            db.commit()
+            try:
+                if page.processing_method == "native_text":
+                    page.status = "done"
+                    page.corrected_image_path = None
+                    page.ocr_result = None
+                else:
+                    worker_payload = await loop.run_in_executor(
+                        _ocr_pool,
+                        run_ocr_file,
+                        str(page.original_image_path),
+                        use_doc_preprocessor,
+                    )
+                    page_result = worker_payload["ocr_result"]
+                    page.ocr_result = json.dumps(page_result, ensure_ascii=False)
+                    page.corrected_image_path = worker_payload[
+                        "corrected_image_path"
+                    ]
+                    page.status = "done"
+                    if page.page_index == 0:
+                        first_page_ocr_result = page_result
+
+                page.error_msg = None
+                successful_pages += 1
+            except Exception as exc:
+                page.status = "failed"
+                page.error_msg = str(exc)
+                failed_pages += 1
+                logger.exception(
+                    "页面处理失败，task_id=%s page_index=%s",
+                    task_id,
+                    page.page_index,
+                )
+
+            db.commit()
+            _write_page_result(page)
 
         task = db.query(Task).filter(Task.task_id == task_id).first()
-        if task:
-            task.ocr_result = result_json
+        if not task:
+            return
+        task.ocr_result = (
+            json.dumps(first_page_ocr_result, ensure_ascii=False)
+            if first_page_ocr_result
+            else None
+        )
+        if successful_pages > 0:
             task.status = "done"
-            db.commit()
+            task.error_msg = (
+                f"{failed_pages} 页处理失败"
+                if failed_pages > 0
+                else None
+            )
+        else:
+            task.status = "failed"
+            task.error_msg = "所有页面均处理失败"
+        db.commit()
+
+        refreshed_pages = (
+            db.query(TaskPage)
+            .filter(TaskPage.task_id == task_id)
+            .order_by(TaskPage.page_index)
+            .all()
+        )
+        _write_manifest(task, refreshed_pages)
 
     except Exception as exc:
         db.rollback()
@@ -242,6 +630,14 @@ async def _process_ocr_async(task_id: str, image_path: Path) -> None:
             task.status = "failed"
             task.error_msg = str(exc)
             db.commit()
+            pages = (
+                db.query(TaskPage)
+                .filter(TaskPage.task_id == task_id)
+                .order_by(TaskPage.page_index)
+                .all()
+            )
+            _write_manifest(task, pages)
+        logger.exception("任务处理失败，task_id=%s", task_id)
     finally:
         db.close()
 
@@ -252,7 +648,7 @@ async def _process_ocr_async(task_id: str, image_path: Path) -> None:
     "/tasks",
     response_model=TaskCreateResponse,
     status_code=status.HTTP_202_ACCEPTED,
-    summary="创建 OCR 任务（异步）",
+    summary="创建 OCR 任务（单文件，可包含多页）",
 )
 @limiter.limit(RATE_LIMIT)
 async def create_task(
@@ -263,18 +659,26 @@ async def create_task(
 ):
     suffix = Path(file.filename).suffix.lower() if file.filename else ""
     if suffix not in ALLOWED_EXTENSIONS:
+        supported = ", ".join(sorted(ALLOWED_EXTENSIONS))
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"不支持的文件格式，请上传: {', '.join(ALLOWED_EXTENSIONS)}",
+            detail=f"不支持的文件格式，请上传: {supported}",
         )
 
     ip = get_client_ip(request)
     task_id = str(uuid.uuid4())
     task_dir = _task_dir(ip, task_id)
+    source_path = task_dir / f"original{suffix}"
 
-    image_path = task_dir / f"original{suffix}"
-    contents = await file.read()
-    image_path.write_bytes(contents)
+    try:
+        await _save_upload_file(file, source_path)
+        _validate_uploaded_file(source_path, suffix)
+    except Exception:
+        if task_dir.exists():
+            shutil.rmtree(task_dir)
+        raise
+    finally:
+        await file.close()
 
     task = Task(
         task_id=task_id,
@@ -288,29 +692,23 @@ async def create_task(
     db.add(task)
     db.commit()
 
-    await _task_queue.put((task_id, image_path))
-
+    await _task_queue.put((task_id, source_path))
     return TaskCreateResponse(task_id=task_id, status="queued")
 
 
 @router.get(
     "/tasks/{task_id}",
     response_model=TaskDetailResponse,
-    summary="查询 OCR 任务状态与结果",
+    summary="查询 OCR 任务状态与逐页结果",
 )
 def get_task(task_id: str, db: Session = Depends(get_db)):
     task: Task = db.query(Task).filter(Task.task_id == task_id).first()
     if not task:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="任务不存在")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="任务不存在",
+        )
 
-    ocr_result = None
-    if task.ocr_result:
-        try:
-            ocr_result = json.loads(task.ocr_result)
-        except json.JSONDecodeError:
-            ocr_result = task.ocr_result
-
-    # 计算排队位置：比本任务更早入队（created_at 更小）且仍在 queued 的任务数 + 1
     queue_position: Optional[int] = None
     if task.status == "queued":
         ahead = (
@@ -320,32 +718,102 @@ def get_task(task_id: str, db: Session = Depends(get_db)):
         )
         queue_position = ahead + 1
 
-    return _build_task_response(task, ocr_result, queue_position)
+    return _build_task_response(db, task, queue_position)
+
+
+def _serve_image_file(image_file: Path) -> FileResponse:
+    media_type, _ = mimetypes.guess_type(image_file.name)
+    return FileResponse(
+        path=str(image_file),
+        media_type=media_type or "image/png",
+    )
+
+
+@router.get(
+    "/tasks/{task_id}/pages/{page_index}/image",
+    summary="获取任务指定页面图片",
+)
+def get_task_page_image(
+    task_id: str,
+    page_index: int,
+    variant: str = "original",
+    db: Session = Depends(get_db),
+):
+    if variant not in {"original", "corrected"}:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="不支持的图片变体",
+        )
+
+    task: Task = db.query(Task).filter(Task.task_id == task_id).first()
+    if not task:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="任务不存在",
+        )
+
+    page = (
+        db.query(TaskPage)
+        .filter(
+            TaskPage.task_id == task_id,
+            TaskPage.page_index == page_index,
+        )
+        .first()
+    )
+    if page is not None:
+        image_file = _page_image_files(page)[variant]
+    elif page_index == 0 and task.file_dir and _task_file_type(task) == "image":
+        image_file = _legacy_task_image_files(Path(task.file_dir))[variant]
+    else:
+        image_file = None
+
+    if image_file is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="页面图片不存在",
+        )
+    return _serve_image_file(image_file)
 
 
 @router.get(
     "/tasks/{task_id}/image",
-    summary="获取任务图片",
+    summary="获取任务第一页面图片（兼容接口）",
 )
 def get_task_image(
     task_id: str,
     variant: str = "original",
     db: Session = Depends(get_db),
 ):
+    if variant not in {"original", "corrected"}:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="不支持的图片变体",
+        )
+
     task: Task = db.query(Task).filter(Task.task_id == task_id).first()
     if not task or not task.file_dir:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="任务不存在")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="任务不存在",
+        )
 
-    task_dir = Path(task.file_dir)
-    image_files = _task_image_files(task_dir)
-    if variant not in image_files:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="不支持的图片变体")
-    image_file = image_files[variant]
+    first_page = (
+        db.query(TaskPage)
+        .filter(TaskPage.task_id == task_id)
+        .order_by(TaskPage.page_index)
+        .first()
+    )
+    image_file = (
+        _page_image_files(first_page)[variant]
+        if first_page is not None
+        else _legacy_task_image_files(Path(task.file_dir))[variant]
+    )
     if image_file is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="图片不存在")
-
-    media_type, _ = mimetypes.guess_type(image_file.name)
-    return FileResponse(path=str(image_file), media_type=media_type or "image/jpeg")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="图片不存在",
+        )
+    return _serve_image_file(image_file)
 
 
 @router.get(
@@ -368,18 +836,13 @@ def list_tasks(
     query = db.query(Task).filter(Task.ip == ip).order_by(Task.created_at.desc())
     total = query.count()
     tasks = query.offset((page - 1) * page_size).limit(page_size).all()
-
-    items = []
-    for task in tasks:
-        ocr_result = None
-        if task.ocr_result:
-            try:
-                ocr_result = json.loads(task.ocr_result)
-            except json.JSONDecodeError:
-                ocr_result = task.ocr_result
-
-        items.append(
-            _build_task_response(task, ocr_result)
-        )
-
-    return TaskListResponse(total=total, page=page, page_size=page_size, items=items)
+    items = [
+        _build_task_response(db, task, include_page_results=False)
+        for task in tasks
+    ]
+    return TaskListResponse(
+        total=total,
+        page=page,
+        page_size=page_size,
+        items=items,
+    )
