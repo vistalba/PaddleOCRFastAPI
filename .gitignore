@@ -5,3 +5,4 @@ test.py
 uploads/
 ocr_tasks.db
 tmp/
+*.gguf

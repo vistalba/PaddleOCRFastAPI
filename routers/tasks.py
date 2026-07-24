@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 
 import asyncio
+import ipaddress
 import json
 import logging
 import mimetypes
 import re
 import shutil
 import uuid
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from datetime import datetime, timedelta, timezone
 from math import ceil
@@ -45,12 +46,22 @@ from utils.ocr_worker import (
     prepare_document_files,
     run_ocr_file,
 )
+from utils.text_organizer import (
+    TextOrganizerError,
+    ai_organizer_status,
+    build_ai_result,
+    build_rule_result,
+)
 
 logger = logging.getLogger(__name__)
 
 # OCR 模型与 PDF 渲染均在进程池中执行，避免阻塞 FastAPI 事件循环。
 _ocr_pool = ProcessPoolExecutor(max_workers=MAX_CONCURRENT_OCR)
 _ocr_pool_lock = asyncio.Lock()
+
+# llama.cpp 自身管理 CPU 线程；单独的单 worker 线程池保证模型只加载一份。
+_ai_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="text-ai")
+_ai_page_locks: dict[tuple[str, int], asyncio.Lock] = {}
 
 # 一个队列任务对应一个有序输入集合：单图/PDF 为 1 个路径，多图为 N 个路径。
 _task_queue: asyncio.Queue[tuple[str, tuple[Path, ...]]] = asyncio.Queue()
@@ -95,6 +106,12 @@ class TaskPageResponse(BaseModel):
     ocr_image_variant: str = "original"
     native_text: Optional[str] = None
     ocr_result: Optional[Any] = None
+    rule_result: Optional[Any] = None
+    ai_result: Optional[Any] = None
+    ai_status: str = "not_started"
+    ai_model_name: Optional[str] = None
+    ai_processed_at: Optional[datetime] = None
+    ai_error: Optional[str] = None
     error_msg: Optional[str] = None
 
 
@@ -120,6 +137,10 @@ class TaskDetailResponse(BaseModel):
     queue_position: Optional[int] = None
     retry_available_at: Optional[datetime] = None
     retry_after_seconds: int = 0
+    ai_organizer_available: bool = False
+    ai_organizer_model: Optional[str] = None
+    ai_organizer_unavailable_reason: Optional[str] = None
+    ai_repeat_allowed: bool = False
 
 
 class TaskListResponse(BaseModel):
@@ -127,6 +148,16 @@ class TaskListResponse(BaseModel):
     page: int
     page_size: int
     items: List[TaskDetailResponse]
+
+
+class AIOrganizePageResponse(BaseModel):
+    task_id: str
+    page_index: int
+    ai_status: str
+    ai_result: Optional[Any] = None
+    ai_model_name: Optional[str] = None
+    ai_processed_at: Optional[datetime] = None
+    ai_error: Optional[str] = None
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -174,6 +205,33 @@ def _parse_json(value: Optional[str]) -> Optional[Any]:
         return json.loads(value)
     except json.JSONDecodeError:
         return value
+
+
+def _serialize_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _is_loopback_ip(value: str) -> bool:
+    try:
+        return ipaddress.ip_address(value).is_loopback
+    except ValueError:
+        return False
+
+
+def _build_rule_result_for_page(page: TaskPage) -> dict[str, Any]:
+    return build_rule_result(
+        processing_method=page.processing_method,
+        native_text=page.native_text,
+        ocr_result=_parse_json(page.ocr_result),
+        page_width=page.width,
+    )
+
+
+def _ensure_rule_result(page: TaskPage) -> bool:
+    if page.status != "done" or page.rule_result:
+        return False
+    page.rule_result = _serialize_json(_build_rule_result_for_page(page))
+    return True
 
 
 def _retry_state_path(task: Task) -> Optional[Path]:
@@ -385,6 +443,16 @@ def _build_page_response(
         ocr_image_variant=ocr_image_variant,
         native_text=page.native_text if include_result else None,
         ocr_result=ocr_result,
+        rule_result=(
+            _parse_json(page.rule_result) if include_result else None
+        ),
+        ai_result=(
+            _parse_json(page.ai_result) if include_result else None
+        ),
+        ai_status=page.ai_status or "not_started",
+        ai_model_name=page.ai_model_name,
+        ai_processed_at=page.ai_processed_at,
+        ai_error=page.ai_error,
         error_msg=page.error_msg,
     )
 
@@ -402,6 +470,15 @@ def _build_legacy_page_response(
         return None
 
     ocr_result = _parse_json(task.ocr_result) if include_result else None
+    rule_result = (
+        build_rule_result(
+            processing_method="ocr",
+            native_text=None,
+            ocr_result=ocr_result,
+        )
+        if include_result and ocr_result
+        else None
+    )
     ocr_image_variant = _resolve_result_image_variant(
         ocr_result,
         corrected_exists=image_files["corrected"] is not None,
@@ -417,6 +494,7 @@ def _build_legacy_page_response(
         ),
         ocr_image_variant=ocr_image_variant,
         ocr_result=ocr_result,
+        rule_result=rule_result,
         error_msg=task.error_msg,
     )
 
@@ -426,6 +504,7 @@ def _build_task_response(
     task: Task,
     queue_position: Optional[int] = None,
     include_page_results: bool = True,
+    ai_repeat_allowed: bool = False,
 ) -> TaskDetailResponse:
     page_models = (
         db.query(TaskPage)
@@ -433,6 +512,15 @@ def _build_task_response(
         .order_by(TaskPage.page_index)
         .all()
     )
+    if include_page_results:
+        rule_result_pages: list[TaskPage] = []
+        for page in page_models:
+            if _ensure_rule_result(page):
+                rule_result_pages.append(page)
+        if rule_result_pages:
+            db.commit()
+            for page in rule_result_pages:
+                _write_page_result(page)
     pages = [
         _build_page_response(task, page, include_page_results)
         for page in page_models
@@ -450,6 +538,7 @@ def _build_task_response(
     completed_pages = sum(page.status == "done" for page in pages)
     failed_pages = sum(page.status == "failed" for page in pages)
     retry_available_at, retry_after_seconds = _retry_after_seconds(task)
+    ai_status = ai_organizer_status()
     return TaskDetailResponse(
         task_id=task.task_id,
         ip=task.ip,
@@ -476,6 +565,10 @@ def _build_task_response(
         queue_position=queue_position,
         retry_available_at=retry_available_at,
         retry_after_seconds=retry_after_seconds,
+        ai_organizer_available=bool(ai_status["available"]),
+        ai_organizer_model=ai_status["model_name"],
+        ai_organizer_unavailable_reason=ai_status["reason"],
+        ai_repeat_allowed=ai_repeat_allowed,
     )
 
 
@@ -544,6 +637,16 @@ def _write_page_result(page: TaskPage) -> None:
         "processing_method": page.processing_method,
         "native_text": page.native_text,
         "ocr_result": _parse_json(page.ocr_result),
+        "rule_result": _parse_json(page.rule_result),
+        "ai_result": _parse_json(page.ai_result),
+        "ai_status": page.ai_status or "not_started",
+        "ai_model_name": page.ai_model_name,
+        "ai_processed_at": (
+            page.ai_processed_at.isoformat()
+            if page.ai_processed_at
+            else None
+        ),
+        "ai_error": page.ai_error,
         "error_msg": page.error_msg,
     }
     result_path.write_text(
@@ -627,6 +730,17 @@ async def start_workers() -> None:
 
     db = SessionLocal()
     try:
+        stale_ai_pages = (
+            db.query(TaskPage)
+            .filter(TaskPage.ai_status == "processing")
+            .all()
+        )
+        for page in stale_ai_pages:
+            page.ai_status = "failed"
+            page.ai_error = "服务重启导致 AI 整理中断，请重新整理"
+        if stale_ai_pages:
+            db.commit()
+
         stuck = (
             db.query(Task)
             .filter(Task.status.in_(["queued", "processing"]))
@@ -691,6 +805,12 @@ def _upsert_task_pages(
         page.corrected_image_path = None
         page.native_text = item.get("native_text")
         page.ocr_result = None
+        page.rule_result = None
+        page.ai_result = None
+        page.ai_status = "not_started"
+        page.ai_model_name = None
+        page.ai_processed_at = None
+        page.ai_error = None
         page.error_msg = preparation_error
         pages.append(page)
 
@@ -766,6 +886,14 @@ async def _process_ocr_async(
                     if page.page_index == 0:
                         first_page_ocr_result = page_result
 
+                page.rule_result = _serialize_json(
+                    _build_rule_result_for_page(page)
+                )
+                page.ai_result = None
+                page.ai_status = "not_started"
+                page.ai_model_name = None
+                page.ai_processed_at = None
+                page.ai_error = None
                 page.error_msg = None
                 successful_pages += 1
             except Exception as exc:
@@ -1039,6 +1167,12 @@ def _reset_failed_task_for_retry(
         page.status = "queued"
         page.error_msg = None
         page.ocr_result = None
+        page.rule_result = None
+        page.ai_result = None
+        page.ai_status = "not_started"
+        page.ai_model_name = None
+        page.ai_processed_at = None
+        page.ai_error = None
         page.corrected_image_path = None
 
     db.commit()
@@ -1080,7 +1214,11 @@ async def retry_task(
     response_model=TaskDetailResponse,
     summary="查询 OCR 任务状态与逐页结果",
 )
-def get_task(task_id: str, db: Session = Depends(get_db)):
+def get_task(
+    request: Request,
+    task_id: str,
+    db: Session = Depends(get_db),
+):
     task: Task = db.query(Task).filter(Task.task_id == task_id).first()
     if not task:
         raise HTTPException(
@@ -1097,7 +1235,208 @@ def get_task(task_id: str, db: Session = Depends(get_db)):
         )
         queue_position = ahead + 1
 
-    return _build_task_response(db, task, queue_position)
+    return _build_task_response(
+        db,
+        task,
+        queue_position,
+        ai_repeat_allowed=_is_loopback_ip(get_client_ip(request)),
+    )
+
+
+def _materialize_legacy_page(
+    db: Session,
+    task: Task,
+    page_index: int,
+) -> Optional[TaskPage]:
+    if (
+        page_index != 0
+        or _task_file_type(task) != "image"
+        or not task.file_dir
+    ):
+        return None
+    image_files = _legacy_task_image_files(Path(task.file_dir))
+    if image_files["original"] is None:
+        return None
+    page = TaskPage(
+        task_id=task.task_id,
+        page_index=0,
+        status=task.status,
+        processing_method="ocr",
+        original_image_path=str(image_files["original"]),
+        corrected_image_path=(
+            str(image_files["corrected"])
+            if image_files["corrected"] is not None
+            else None
+        ),
+        ocr_result=task.ocr_result,
+    )
+    db.add(page)
+    db.flush()
+    _ensure_rule_result(page)
+    db.commit()
+    return page
+
+
+async def _run_in_ai_pool(page: TaskPage) -> dict[str, Any]:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        _ai_pool,
+        build_ai_result,
+        page.processing_method,
+        page.native_text,
+        _parse_json(page.ocr_result),
+        page.width,
+    )
+
+
+@router.post(
+    "/tasks/{task_id}/pages/{page_index}/organize",
+    response_model=AIOrganizePageResponse,
+    summary="使用可选的本地模型整理当前页文字",
+)
+@limiter.limit(RATE_LIMIT)
+async def organize_task_page(
+    request: Request,
+    task_id: str,
+    page_index: int,
+    db: Session = Depends(get_db),
+):
+    key = (task_id, page_index)
+    page_lock = _ai_page_locks.setdefault(key, asyncio.Lock())
+    async with page_lock:
+        db.expire_all()
+        task: Task = (
+            db.query(Task)
+            .filter(Task.task_id == task_id)
+            .first()
+        )
+        if not task:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="任务不存在",
+            )
+        page = (
+            db.query(TaskPage)
+            .filter(
+                TaskPage.task_id == task_id,
+                TaskPage.page_index == page_index,
+            )
+            .first()
+        )
+        if page is None:
+            page = _materialize_legacy_page(
+                db, task, page_index
+            )
+        if page is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="页面不存在",
+            )
+        if page.status != "done":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="页面识别完成后才能进行 AI 整理",
+            )
+
+        repeat_allowed = _is_loopback_ip(get_client_ip(request))
+        if page.ai_result and not repeat_allowed:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="当前页已经通过 AI 整理",
+            )
+        if page.ai_status == "processing":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="当前页正在进行 AI 整理",
+            )
+
+        organizer = ai_organizer_status()
+        if not organizer["available"]:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=organizer["reason"],
+            )
+        _ensure_rule_result(page)
+        rule_result = _parse_json(page.rule_result)
+        if not isinstance(rule_result, dict) or not rule_result.get(
+            "segments"
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="当前页没有可整理的文字",
+            )
+
+        page.ai_status = "processing"
+        page.ai_error = None
+        db.commit()
+        _write_page_result(page)
+
+        try:
+            ai_result = await _run_in_ai_pool(page)
+        except TextOrganizerError as exc:
+            page = (
+                db.query(TaskPage)
+                .filter(
+                    TaskPage.task_id == task_id,
+                    TaskPage.page_index == page_index,
+                )
+                .one()
+            )
+            page.ai_status = "failed"
+            page.ai_error = str(exc)
+            db.commit()
+            _write_page_result(page)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"AI 整理失败：{exc}",
+            ) from exc
+        except Exception as exc:
+            logger.exception(
+                "AI 整理失败，task_id=%s page_index=%s",
+                task_id,
+                page_index,
+            )
+            page = (
+                db.query(TaskPage)
+                .filter(
+                    TaskPage.task_id == task_id,
+                    TaskPage.page_index == page_index,
+                )
+                .one()
+            )
+            page.ai_status = "failed"
+            page.ai_error = "AI 整理发生内部错误"
+            db.commit()
+            _write_page_result(page)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="AI 整理发生内部错误",
+            ) from exc
+
+        page = (
+            db.query(TaskPage)
+            .filter(
+                TaskPage.task_id == task_id,
+                TaskPage.page_index == page_index,
+            )
+            .one()
+        )
+        processed_at = _utcnow()
+        page.ai_result = _serialize_json(ai_result)
+        page.ai_status = "done"
+        page.ai_model_name = organizer["model_name"]
+        page.ai_processed_at = processed_at
+        page.ai_error = None
+        db.commit()
+        _write_page_result(page)
+        return AIOrganizePageResponse(
+            task_id=task_id,
+            page_index=page_index,
+            ai_status="done",
+            ai_result=ai_result,
+            ai_model_name=page.ai_model_name,
+            ai_processed_at=processed_at,
+        )
 
 
 @router.delete(

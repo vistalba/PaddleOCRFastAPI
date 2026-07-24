@@ -207,6 +207,51 @@ PP-OCRv6_medium 的完整说明见
 PP-OCRv6 使用统一模型支持中文、英文、日文及多种拉丁语系语言，不再使用旧的
 `OCR_LANGUAGE` 配置切换模型。
 
+## 文本分段与可选 AI 整理
+
+OCR 完成后，服务会使用文字框坐标、行距、缩进、标题和列表等规则自动恢复
+段落，并将规则结果随逐页任务保存。结果页默认展示规则分段，同时可以随时切换
+到原始 OCR 行。
+
+AI 整理为可选能力，只在用户点击“AI 整理当前页”后运行，并且仅处理当前页。
+模型只决定原始行的分组，不允许改写、遗漏或重排行。整理结果、模型名称和完成
+时间会保存到页面记录中。普通客户端每页只能整理一次；来自 `127.0.0.1`
+或 `::1` 的调试请求可以重复整理并覆盖该页上一次 AI 结果。
+
+AI 推理使用 `llama-cpp-python`，支持包含聊天模板的自定义 GGUF 指令模型：
+
+1. 安装可选依赖：
+
+   ```shell
+   uv sync --extra ai
+   ```
+
+2. 手动创建模型目录并放入 GGUF 文件，例如：
+
+   ```text
+   local_models/
+   └─ Qwen3-0.6B-Q4_K_M.gguf
+   ```
+
+3. 在 `.env` 中配置：
+
+   ```dotenv
+   AI_TEXT_MODEL_PATH=local_models/Qwen3-0.6B-Q4_K_M.gguf
+   AI_TEXT_MODEL_NAME=Qwen3-0.6B-Q4_K_M
+   AI_TEXT_MODEL_CONTEXT_SIZE=4096
+   AI_TEXT_MODEL_THREADS=4
+   AI_TEXT_MODEL_GPU_LAYERS=0
+   ```
+
+`AI_TEXT_MODEL_PATH` 未配置、文件不存在或没有安装可选依赖时，AI 按钮会显示
+不可用，但不会影响 OCR 与坐标规则分段。相对路径以 FastAPI 启动目录为基准。
+服务只维护一份常驻模型实例，AI 请求按顺序执行，避免并发重复加载模型。
+
+Docker 部署时还需把 `docker-compose.yml` 中的
+`build.args.INSTALL_AI` 改为 `true`，取消 AI 模型路径和
+`local_models` 只读挂载的注释，然后重新构建镜像。默认镜像保持不安装 AI
+依赖，因此不会增加只使用规则分段的部署体积。
+
 ## 运行截图
 API 文档：`/docs`
 

@@ -23,6 +23,11 @@ dependencies = [
     "pypdfium2>=4.30",
 ]
 
+[project.optional-dependencies]
+ai = [
+    "llama-cpp-python>=0.3.16",
+]
+
 [[tool.uv.index]]
 url = "https://pypi.tuna.tsinghua.edu.cn/simple"
 default = true

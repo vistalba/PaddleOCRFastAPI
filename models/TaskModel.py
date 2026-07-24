@@ -64,6 +64,16 @@ class TaskPage(Base):
     corrected_image_path = Column(String(512), nullable=True)
     native_text = Column(large_text_type, nullable=True)
     ocr_result = Column(large_text_type, nullable=True)
+    rule_result = Column(large_text_type, nullable=True)
+    ai_result = Column(large_text_type, nullable=True)
+    ai_status = Column(
+        String(20),
+        nullable=False,
+        default="not_started",
+    )
+    ai_model_name = Column(String(255), nullable=True)
+    ai_processed_at = Column(DateTime, nullable=True)
+    ai_error = Column(Text, nullable=True)
     error_msg = Column(Text, nullable=True)
 
     task = relationship("Task", back_populates="pages")

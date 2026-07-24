@@ -6,7 +6,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from fastapi import HTTPException, UploadFile
 from PIL import Image
@@ -497,6 +497,134 @@ class TaskPipelineTests(unittest.TestCase):
             self.assertEqual(retried_response.retry_after_seconds, 0)
         finally:
             db.close()
+
+    def test_ai_organization_is_saved_and_only_loopback_can_repeat(self):
+        ocr_result = [
+            {
+                "rec_texts": ["第一行", "第二行"],
+                "rec_scores": [0.99, 0.98],
+                "rec_polys": [
+                    [[0, 0], [100, 0], [100, 10], [0, 10]],
+                    [[0, 14], [100, 14], [100, 24], [0, 24]],
+                ],
+                "rec_boxes": [[0, 0, 100, 10], [0, 14, 100, 24]],
+            }
+        ]
+        db = self.session_factory()
+        db.add(
+            Task(
+                task_id="ai-task",
+                ip="10.0.0.8",
+                status="done",
+                original_filename="ai.png",
+                pages=[
+                    TaskPage(
+                        page_index=0,
+                        status="done",
+                        processing_method="ocr",
+                        width=120,
+                        height=80,
+                        ocr_result=json.dumps(ocr_result),
+                    )
+                ],
+            )
+        )
+        db.commit()
+
+        first_result = {
+            "version": 1,
+            "method": "local_ai",
+            "model_name": "test-model",
+            "segments": [
+                {
+                    "text": "第一行第二行",
+                    "source_line_indices": [0, 1],
+                }
+            ],
+            "text": "第一行第二行",
+        }
+        second_result = {
+            **first_result,
+            "segments": [
+                {"text": "第一行", "source_line_indices": [0]},
+                {"text": "第二行", "source_line_indices": [1]},
+            ],
+            "text": "第一行\n\n第二行",
+        }
+        remote_request = Request({
+            "type": "http",
+            "method": "POST",
+            "path": "/ocr/tasks/ai-task/pages/0/organize",
+            "headers": [],
+            "query_string": b"",
+            "client": ("10.0.0.8", 1234),
+            "server": ("testserver", 80),
+            "scheme": "http",
+        })
+        local_request = Request({
+            **remote_request.scope,
+            "client": ("127.0.0.1", 1234),
+        })
+
+        async def run_scenario():
+            with (
+                patch.object(
+                    tasks,
+                    "ai_organizer_status",
+                    return_value={
+                        "available": True,
+                        "model_name": "test-model",
+                        "reason": None,
+                    },
+                ),
+                patch.object(
+                    tasks,
+                    "_run_in_ai_pool",
+                    new=AsyncMock(
+                        side_effect=[first_result, second_result]
+                    ),
+                ),
+            ):
+                response = await tasks.organize_task_page(
+                    remote_request,
+                    "ai-task",
+                    0,
+                    db,
+                )
+                self.assertEqual(response.ai_status, "done")
+                with self.assertRaises(HTTPException) as repeated:
+                    await tasks.organize_task_page(
+                        remote_request,
+                        "ai-task",
+                        0,
+                        db,
+                    )
+                self.assertEqual(
+                    repeated.exception.status_code,
+                    409,
+                )
+                repeated_response = await tasks.organize_task_page(
+                    local_request,
+                    "ai-task",
+                    0,
+                    db,
+                )
+                self.assertEqual(
+                    len(repeated_response.ai_result["segments"]),
+                    2,
+                )
+
+        asyncio.run(run_scenario())
+        page = (
+            db.query(TaskPage)
+            .filter(TaskPage.task_id == "ai-task")
+            .one()
+        )
+        self.assertEqual(page.ai_status, "done")
+        self.assertEqual(len(json.loads(page.ai_result)["segments"]), 2)
+        self.assertIsNotNone(page.rule_result)
+        self.assertIsNotNone(page.ai_processed_at)
+        db.close()
 
     def test_delete_finished_task_removes_database_rows_and_files(self):
         task_dir = self.root / "deletable-task"
