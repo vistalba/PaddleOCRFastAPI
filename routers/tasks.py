@@ -47,6 +47,7 @@ from utils.ocr_worker import (
     run_ocr_file,
 )
 from utils.text_organizer import (
+    ORGANIZATION_RESULT_VERSION,
     TextOrganizerError,
     ai_organizer_status,
     build_ai_result,
@@ -228,7 +229,14 @@ def _build_rule_result_for_page(page: TaskPage) -> dict[str, Any]:
 
 
 def _ensure_rule_result(page: TaskPage) -> bool:
-    if page.status != "done" or page.rule_result:
+    if page.status != "done":
+        return False
+    existing_result = _parse_json(page.rule_result)
+    if (
+        isinstance(existing_result, dict)
+        and existing_result.get("version")
+        == ORGANIZATION_RESULT_VERSION
+    ):
         return False
     page.rule_result = _serialize_json(_build_rule_result_for_page(page))
     return True

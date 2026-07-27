@@ -39,6 +39,31 @@ class TaskPipelineTests(unittest.TestCase):
         self.engine.dispose()
         self.temp_dir.cleanup()
 
+    def test_stale_rule_result_version_is_rebuilt(self):
+        page = TaskPage(
+            task_id="stale-rule",
+            page_index=0,
+            status="done",
+            processing_method="ocr",
+            ocr_result="[]",
+            rule_result=json.dumps({"version": 1, "segments": []}),
+        )
+        rebuilt = {
+            "version": tasks.ORGANIZATION_RESULT_VERSION,
+            "method": "coordinate_rules",
+            "segments": [],
+            "text": "",
+        }
+        with patch.object(
+            tasks,
+            "_build_rule_result_for_page",
+            return_value=rebuilt,
+        ) as builder:
+            self.assertTrue(tasks._ensure_rule_result(page))
+            self.assertFalse(tasks._ensure_rule_result(page))
+        builder.assert_called_once_with(page)
+        self.assertEqual(json.loads(page.rule_result), rebuilt)
+
     def test_old_image_task_is_exposed_as_one_page(self):
         task_dir = self.root / "legacy"
         task_dir.mkdir()
@@ -531,9 +556,9 @@ class TaskPipelineTests(unittest.TestCase):
         )
         db.commit()
 
-        first_result = {
+        first_page_result = {
             "version": 1,
-            "method": "local_ai",
+            "method": "local_ai_page",
             "model_name": "test-model",
             "segments": [
                 {
@@ -543,14 +568,49 @@ class TaskPipelineTests(unittest.TestCase):
             ],
             "text": "第一行第二行",
         }
-        second_result = {
-            **first_result,
+        first_boundary_result = {
+            **first_page_result,
+            "method": "local_ai_boundary",
             "segments": [
                 {"text": "第一行", "source_line_indices": [0]},
                 {"text": "第二行", "source_line_indices": [1]},
             ],
             "text": "第一行\n\n第二行",
         }
+
+        def comparison_result(primary, page_result, boundary_result):
+            return {
+                **primary,
+                "method": "local_ai_compare",
+                "selected_variant": (
+                    "page" if primary is page_result else "boundary"
+                ),
+                "variants": {
+                    "page": {
+                        "status": "done",
+                        "duration_ms": 120,
+                        "result": page_result,
+                        "error": None,
+                    },
+                    "boundary": {
+                        "status": "done",
+                        "duration_ms": 180,
+                        "result": boundary_result,
+                        "error": None,
+                    },
+                },
+            }
+
+        first_result = comparison_result(
+            first_page_result,
+            first_page_result,
+            first_boundary_result,
+        )
+        second_result = comparison_result(
+            first_boundary_result,
+            first_page_result,
+            first_boundary_result,
+        )
         remote_request = Request({
             "type": "http",
             "method": "POST",
@@ -621,7 +681,12 @@ class TaskPipelineTests(unittest.TestCase):
             .one()
         )
         self.assertEqual(page.ai_status, "done")
-        self.assertEqual(len(json.loads(page.ai_result)["segments"]), 2)
+        saved_ai_result = json.loads(page.ai_result)
+        self.assertEqual(len(saved_ai_result["segments"]), 2)
+        self.assertEqual(
+            set(saved_ai_result["variants"]),
+            {"page", "boundary"},
+        )
         self.assertIsNotNone(page.rule_result)
         self.assertIsNotNone(page.ai_processed_at)
         db.close()

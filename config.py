@@ -32,6 +32,11 @@ AI_TEXT_MODEL_NAME: str = os.getenv("AI_TEXT_MODEL_NAME", "").strip()
 AI_TEXT_MODEL_CHAT_FORMAT: str = os.getenv(
     "AI_TEXT_MODEL_CHAT_FORMAT", ""
 ).strip()
+AI_TEXT_ORGANIZER_MODE: str = os.getenv(
+    "AI_TEXT_ORGANIZER_MODE", "compare"
+).strip().lower()
+if AI_TEXT_ORGANIZER_MODE not in {"page", "boundary", "compare"}:
+    AI_TEXT_ORGANIZER_MODE = "compare"
 AI_TEXT_MODEL_CONTEXT_SIZE: int = max(
     512,
     int(os.getenv("AI_TEXT_MODEL_CONTEXT_SIZE", "4096")),
@@ -53,6 +58,24 @@ AI_TEXT_MODEL_MAX_TOKENS: int = max(
     int(os.getenv("AI_TEXT_MODEL_MAX_TOKENS", "768")),
 )
 AI_TEXT_MODEL_SEED: int = int(os.getenv("AI_TEXT_MODEL_SEED", "2026"))
+AI_TEXT_BOUNDARY_MERGE_THRESHOLD: float = min(
+    1.0,
+    max(
+        0.5,
+        float(os.getenv("AI_TEXT_BOUNDARY_MERGE_THRESHOLD", "0.72")),
+    ),
+)
+AI_TEXT_BOUNDARY_SPLIT_THRESHOLD: float = min(
+    0.5,
+    max(
+        0.0,
+        float(os.getenv("AI_TEXT_BOUNDARY_SPLIT_THRESHOLD", "0.20")),
+    ),
+)
+AI_TEXT_BOUNDARY_CONTEXT_CHARS: int = max(
+    100,
+    int(os.getenv("AI_TEXT_BOUNDARY_CONTEXT_CHARS", "600")),
+)
 AI_TEXT_MAX_LINES_PER_CHUNK: int = max(
     10,
     int(os.getenv("AI_TEXT_MAX_LINES_PER_CHUNK", "80")),
@@ -60,4 +83,20 @@ AI_TEXT_MAX_LINES_PER_CHUNK: int = max(
 AI_TEXT_MAX_INPUT_CHARS: int = max(
     1000,
     int(os.getenv("AI_TEXT_MAX_INPUT_CHARS", "7000")),
+)
+TEXT_RULE_FONT_HEIGHT_RATIO: float = max(
+    1.05,
+    float(os.getenv("TEXT_RULE_FONT_HEIGHT_RATIO", "1.55")),
+)
+TEXT_RULE_TITLE_BODY_HEIGHT_RATIO: float = max(
+    1.05,
+    float(os.getenv("TEXT_RULE_TITLE_BODY_HEIGHT_RATIO", "1.18")),
+)
+TEXT_RULE_LINE_STEP_RATIO: float = max(
+    1.05,
+    float(os.getenv("TEXT_RULE_LINE_STEP_RATIO", "2.0")),
+)
+TEXT_RULE_HORIZONTAL_GAP_RATIO: float = max(
+    1.0,
+    float(os.getenv("TEXT_RULE_HORIZONTAL_GAP_RATIO", "3.0")),
 )

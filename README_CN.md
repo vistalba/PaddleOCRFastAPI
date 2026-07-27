@@ -238,9 +238,16 @@ AI 推理使用 `llama-cpp-python`，支持包含聊天模板的自定义 GGUF �
    ```dotenv
    AI_TEXT_MODEL_PATH=local_models/Qwen3-0.6B-Q8_0.gguf
    AI_TEXT_MODEL_NAME=Qwen3-0.6B-Q8_0
+   AI_TEXT_ORGANIZER_MODE=compare
    AI_TEXT_MODEL_CONTEXT_SIZE=4096
    AI_TEXT_MODEL_THREADS=4
    AI_TEXT_MODEL_GPU_LAYERS=0
+   AI_TEXT_BOUNDARY_MERGE_THRESHOLD=0.72
+   AI_TEXT_BOUNDARY_SPLIT_THRESHOLD=0.20
+   TEXT_RULE_FONT_HEIGHT_RATIO=1.55
+   TEXT_RULE_TITLE_BODY_HEIGHT_RATIO=1.18
+   TEXT_RULE_LINE_STEP_RATIO=2.0
+   TEXT_RULE_HORIZONTAL_GAP_RATIO=3.0
    ```
 
 `AI_TEXT_MODEL_PATH` 未配置、文件不存在或没有安装可选依赖时，AI 按钮会显示
@@ -248,6 +255,24 @@ AI 推理使用 `llama-cpp-python`，支持包含聊天模板的自定义 GGUF �
 服务只维护一份常驻模型实例，AI 请求按顺序执行，避免并发重复加载模型。
 内置提示词会为 Qwen3 添加 `/no_think`，并通过 JSON Schema 和行号完整性
 校验限制模型只能决定相邻行的分组，不能改写 OCR 原文。
+
+开发期默认使用 `AI_TEXT_ORGANIZER_MODE=compare`：同一次整理会依次运行
+“整页分组”和“逐边界判断”，保存两份结果、耗时及失败原因，结果页可直接
+切换比较。逐边界模式将输出限制为单个 `0/1` 标签，并使用标签 logprob
+计算合并概率。AI 始终遍历原始 OCR 行，只有高于合并阈值才会合并；低于
+阈值或单次推理失败时保留为两个原始行，不使用坐标规则替 AI 作出合并决定。
+跨栏、字号突变、局部行距过大、横向分块、标题和新列表项会在原始行边界
+直接硬拆，只有物理上可能连续的候选才交给 AI。坐标规则结果只作为每个边界
+的诊断信息保存。确定正式方案后，将模式改为 `page` 或 `boundary` 即可只
+运行一种。
+
+坐标规则会从每行 bbox 高度估算局部字号：相邻字号高度比超过
+`TEXT_RULE_FONT_HEIGHT_RATIO` 时直接拆段；左对齐的较大标题后接较小说明
+文字时，高度比达到 `TEXT_RULE_TITLE_BODY_HEIGHT_RATIO` 也会拆段。相邻
+行首的纵向距离超过较大字号高度的 `TEXT_RULE_LINE_STEP_RATIO` 倍时拆段。
+同一水平行中横向分离的 OCR 框也视为不同文本块；任意相邻框之间的横向
+空隙超过较大字号高度的 `TEXT_RULE_HORIZONTAL_GAP_RATIO` 倍时同样拆段。
+这些倍率可针对实际扫描件继续调整。
 
 Docker 部署时还需把 `docker-compose.yml` 中的
 `build.args.INSTALL_AI` 改为 `true`，取消 AI 模型路径和
