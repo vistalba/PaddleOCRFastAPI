@@ -153,13 +153,13 @@ def _device_kwargs(config: OCRRuntimeConfig) -> dict[str, Any]:
     if config.device.lower().startswith("gpu"):
         import paddle
 
-        if (
+if (
             not paddle.is_compiled_with_cuda()
             or paddle.device.cuda.device_count() == 0
         ):
             raise RuntimeError(
-                f"OCR_DEVICE={device} but no Paddle CUDA GPU available in current environment。"
-                "Windows target machine must have paddlepaddle-gpu installed
+                f"OCR_DEVICE={device} but no Paddle CUDA GPU available in current environment. "
+                "Windows target machine must have paddlepaddle-gpu installed"
             )
 
     return {"device": config.device}
