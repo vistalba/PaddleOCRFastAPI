@@ -23,6 +23,51 @@ A Paddle OCR Web API based on `FastAPI`.
 - [x] Per-page native PDF text or OCR routing
 - [x] Per-page task results, page images, and partial failure handling
 - [x] Retry failed tasks with a server-enforced cooldown
+- [x] Azure Document Intelligence compatibility layer
+
+## Azure Document Intelligence Compatibility
+
+The API provides Azure Document Intelligence-compatible endpoints for integration with Paperless-ngx and other systems:
+
+### Endpoints
+
+**POST `/documentintelligence/documentModels/prebuilt-layout:analyze`**
+- Submit PDF for OCR analysis
+- Returns `202 Accepted` with `Operation-Location` header
+- Parameters: `api-version` (query parameter, default: `2024-11-30`)
+
+**GET `/documentintelligence/operations/{task_id}`**
+- Poll task status and retrieve results
+- Returns `{"status": "running"}` while processing
+- Returns full Azure-compatible JSON when completed
+
+**GET `/documentintelligence/operations/{task_id}/pdf`**
+- Download searchable PDF with embedded text layer
+- Returns PDF binary with selectable text
+
+### Usage Example
+
+```bash
+# Submit PDF for analysis
+curl -X POST "http://localhost:8000/documentintelligence/documentModels/prebuilt-layout:analyze?api-version=2024-11-30" \
+  -F "file=@document.pdf"
+
+# Poll status
+curl "http://localhost:8000/documentintelligence/operations/{task_id}?api-version=2024-11-30"
+
+# Download searchable PDF
+curl "http://localhost:8000/documentintelligence/operations/{task_id}/pdf" -o output.pdf
+```
+
+### Paperless-ngx Integration
+
+Configure Paperless-ngx to use the Azure-compatible endpoint:
+
+```env
+PAPERLESS_OCR_PROVIDER=azure
+PAPERLESS_OCR_AZURE_ENDPOINT=http://your-server:8000
+PAPERLESS_OCR_AZURE_API_VERSION=2024-11-30
+```
 
 ## Image and PDF Tasks
 
