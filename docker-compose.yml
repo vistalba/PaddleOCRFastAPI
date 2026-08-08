@@ -1,4 +1,4 @@
-services:
+﻿services:
 
   PaddleOCR:
     build:
@@ -6,8 +6,8 @@ services:
       args:
         OCR_MODEL_TIER: small
         INSTALL_AI: false
-    container_name: paddle_ocr_api # 自定义容器名
-    image: paddleocrfastapi:latest # 自定义镜像名与标签
+    container_name: paddle_ocr_api # Custom container name
+    image: paddleocrfastapi:latest # Custom image name and tag
     environment:
       - TZ=Asia/Hong_Kong
       - OCR_MODEL_TIER=small
@@ -17,7 +17,7 @@ services:
       - PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True
       - PADDLE_PDX_MODEL_SOURCE=bos
       - PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT=0
-      # 将 build.args.INSTALL_AI 改为 true 并挂载 GGUF 后取消下面两行注释。
+      # Change build.args.INSTALL_AI to true and mount GGUF, then uncomment the following two lines.
       # - AI_TEXT_MODEL_PATH=/app/local_models/Qwen3-0.6B-Q8_0.gguf
       # - AI_TEXT_ORGANIZER_MODE=compare
       # - AI_TEXT_MODEL_THREADS=4
@@ -28,5 +28,5 @@ services:
     # volumes:
     #   - ./local_models:/app/local_models:ro
     ports:
-      - "8000:8000" # 自定义服务暴露端口，8000 为 FastAPI 默认端口
+      - "8000:8000" # Custom service exposure port, 8000 is FastAPI default port
     restart: unless-stopped

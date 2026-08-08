@@ -1,8 +1,8 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
-OCR worker 函数，专供 ProcessPoolExecutor 使用。
-每个 worker 进程在第一次调用时懒加载自己的 OCR / DocPreprocessor 实例，
-后续任务直接复用，避免重复初始化开销。
+OCR worker functions for ProcessPoolExecutor.
+Each worker process lazily loads its own OCR/DocPreprocessor instance on first call,
+reusing it for subsequent tasks to avoid initialization overhead.
 """
 
 from pathlib import Path
@@ -40,7 +40,7 @@ def _get_doc_preprocessor():
 def _save_png(image: Any, output_path: Path) -> None:
     ok, encoded = cv2.imencode(".png", image)
     if not ok:
-        raise RuntimeError("保存矫正后图片失败")
+        raise RuntimeError("Failed to save corrected image")
     output_path.write_bytes(encoded.tobytes())
 
 
@@ -51,12 +51,12 @@ def _run_doc_preprocessor(image_path: Path) -> tuple[Path, dict[str, Any]]:
         use_doc_unwarping=True,
     )
     if not result:
-        raise RuntimeError("文档矫正未返回任何结果")
+        raise RuntimeError("Document preprocessor returned no results")
 
     doc_result = result[0]
     output_img = doc_result.get("output_img")
     if output_img is None:
-        raise RuntimeError("文档矫正结果缺少 output_img")
+        raise RuntimeError("Document preprocessor result missing output_img")
 
     corrected_path = image_path.parent / "corrected.png"
     _save_png(output_img, corrected_path)
@@ -71,8 +71,8 @@ def _run_doc_preprocessor(image_path: Path) -> tuple[Path, dict[str, Any]]:
 
 
 def run_ocr_file(image_path: str, use_doc_preprocessor: bool = False) -> dict[str, Any]:
-    """在 worker 进程中执行 OCR 识别，结果为可序列化的 dict。
-    此函数必须是顶层函数以支持跨进程 pickle。"""
+    """Execute OCR recognition in worker process, returning serializable dict.
+    This function must be a top-level function to support cross-process pickle."""
     source_path = Path(image_path)
     ocr_input = str(source_path)
     ocr_image_variant = "original"
@@ -85,7 +85,7 @@ def run_ocr_file(image_path: str, use_doc_preprocessor: bool = False) -> dict[st
         ocr_image_variant = "corrected"
         corrected_image_path = str(corrected_path)
 
-    # 显式预处理后，OCR 始终对当前输入图做识别，避免再次进入内部文档矫正链路。
+    # After explicit preprocessing, OCR always recognizes the current input image, avoiding re-entry into internal document correction pipeline.
     ocr = _get_ocr()
     results = ocr.predict(ocr_input)
     serialized = [result.json.get("res", result.json) for result in results]

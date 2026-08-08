@@ -28,7 +28,7 @@ class Task(Base):
     original_filename = Column(String(255), nullable=True)
     file_dir = Column(String(512), nullable=True)
     use_doc_preprocessor = Column(Boolean, nullable=False, default=False)
-    ocr_result = Column(Text, nullable=True)   # JSON 字符串
+    ocr_result = Column(Text, nullable=True)   # JSON string
     error_msg = Column(Text, nullable=True)
 
     pages = relationship(

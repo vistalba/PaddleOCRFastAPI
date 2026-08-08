@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """Prepare a single uploaded image or PDF as one or more displayable pages."""
 
 from __future__ import annotations
@@ -61,7 +61,7 @@ def should_use_native_pdf_text(
 
 def _safe_pdf_scale(width: float, height: float) -> float:
     if width <= 0 or height <= 0:
-        raise DocumentPreparationError("PDF 页面尺寸无效")
+        raise DocumentPreparationError("Invalid PDF page dimensions")
 
     requested = max(0.1, PDF_RENDER_SCALE)
     estimated_pixels = width * height * requested * requested
@@ -70,7 +70,7 @@ def _safe_pdf_scale(width: float, height: float) -> float:
 
     scale = math.sqrt(PDF_MAX_RENDER_PIXELS / (width * height))
     if scale < 0.25:
-        raise DocumentPreparationError("PDF 页面尺寸过大，无法在安全范围内渲染")
+        raise DocumentPreparationError("PDF page dimensions too large to render safely")
     return scale
 
 
@@ -95,22 +95,22 @@ def _prepare_pdf(source_path: Path, task_dir: Path) -> list[dict[str, Any]]:
             pdfium.raw.FPDF_ERR_PASSWORD,
             pdfium.raw.FPDF_ERR_SECURITY,
         }:
-            raise DocumentPreparationError("暂不支持加密 PDF") from exc
+            raise DocumentPreparationError("Encrypted PDFs are not yet supported") from exc
         raise DocumentPreparationError(
-            "无法打开 PDF，文件可能损坏或格式不受支持"
+            "Unable to open PDF; file may be corrupted or format unsupported"
         ) from exc
     except Exception as exc:
         raise DocumentPreparationError(
-            "无法打开 PDF，文件可能损坏或格式不受支持"
+            "Unable to open PDF; file may be corrupted or format unsupported"
         ) from exc
 
     try:
         page_count = len(document)
         if page_count < 1:
-            raise DocumentPreparationError("PDF 不包含可处理页面")
+            raise DocumentPreparationError("PDF contains no processable pages")
         if page_count > MAX_PDF_PAGES:
             raise DocumentPreparationError(
-                f"PDF 共 {page_count} 页，超过最大限制 {MAX_PDF_PAGES} 页"
+                f"PDF has {page_count} pages, exceeding maximum limit of {MAX_PDF_PAGES} pages"
             )
 
         pages = []
@@ -126,7 +126,7 @@ def _prepare_pdf(source_path: Path, task_dir: Path) -> list[dict[str, Any]]:
                         "native_text": None,
                         "width": None,
                         "height": None,
-                        "preparation_error": f"PDF 第 {page_index + 1} 页无法读取",
+                        "preparation_error": f"PDF page {page_index + 1} cannot be read",
                     }
                 )
                 continue
@@ -142,7 +142,7 @@ def _prepare_pdf(source_path: Path, task_dir: Path) -> list[dict[str, Any]]:
                     finally:
                         text_page.close()
                 except Exception:
-                    # 文本层不可读时仍可渲染页面并回退到 OCR。
+                    # Page can still be rendered and fall back to OCR when text layer is unreadable。
                     native_text = ""
 
                 page_dir = task_dir / "pages" / f"page_{page_index + 1:04d}"
@@ -176,7 +176,7 @@ def _prepare_pdf(source_path: Path, task_dir: Path) -> list[dict[str, Any]]:
                         "width": None,
                         "height": None,
                         "preparation_error": (
-                            f"PDF 第 {page_index + 1} 页渲染失败：{exc}"
+                            f"PDF page {page_index + 1} failed to render: {exc}"
                         ),
                     }
                 )
@@ -192,10 +192,10 @@ def _prepare_image(source_path: Path) -> list[dict[str, Any]]:
         encoded = np.frombuffer(source_path.read_bytes(), dtype=np.uint8)
         image = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
     except Exception as exc:
-        raise DocumentPreparationError("无法读取上传的图片") from exc
+        raise DocumentPreparationError("Unable to read uploaded image") from exc
 
     if image is None or image.size == 0:
-        raise DocumentPreparationError("无法读取上传的图片")
+        raise DocumentPreparationError("Unable to read uploaded image")
 
     height, width = image.shape[:2]
     return [
@@ -215,7 +215,7 @@ def prepare_document_file(source_path: str) -> dict[str, Any]:
     """Prepare an uploaded source file inside a process-pool worker."""
     path = Path(source_path)
     if not path.is_file():
-        raise DocumentPreparationError("上传文件不存在")
+        raise DocumentPreparationError("Uploaded file does not exist")
 
     file_type = "pdf" if path.suffix.lower() == ".pdf" else "image"
     task_dir = path.parent
@@ -230,11 +230,11 @@ def prepare_document_file(source_path: str) -> dict[str, Any]:
 def prepare_document_files(source_paths: list[str]) -> dict[str, Any]:
     """Prepare an ordered group of images as one multi-page task."""
     if not source_paths:
-        raise DocumentPreparationError("多页任务不包含图片")
+        raise DocumentPreparationError("Multi-page task contains no images")
     if len(source_paths) > MAX_MULTI_IMAGE_PAGES:
         raise DocumentPreparationError(
-            f"多页任务共 {len(source_paths)} 张图片，"
-            f"超过最大限制 {MAX_MULTI_IMAGE_PAGES} 张"
+            f"Multi-page task has {len(source_paths)} images, "
+            f"exceeding maximum limit of {MAX_MULTI_IMAGE_PAGES}"
         )
     if len(source_paths) == 1:
         return prepare_document_file(source_paths[0])
@@ -243,7 +243,7 @@ def prepare_document_files(source_paths: list[str]) -> dict[str, Any]:
     for page_index, source_path in enumerate(source_paths):
         path = Path(source_path)
         if path.suffix.lower() == ".pdf":
-            raise DocumentPreparationError("多页图片模式暂不支持 PDF")
+            raise DocumentPreparationError("Multi-page image mode does not yet support PDF")
         try:
             page = _prepare_image(path)[0]
             page["page_index"] = page_index
@@ -258,7 +258,7 @@ def prepare_document_files(source_paths: list[str]) -> dict[str, Any]:
                     "width": None,
                     "height": None,
                     "preparation_error": (
-                        f"第 {page_index + 1} 张图片处理失败：{exc}"
+                        f"Image {page_index + 1} failed to process: {exc}"
                     ),
                 }
             )

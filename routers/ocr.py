@@ -37,12 +37,12 @@ def _preprocess_image(image: Any) -> tuple[Any, dict[str, Any]]:
         use_doc_unwarping=True,
     )
     if not result:
-        raise RuntimeError("文档矫正未返回任何结果")
+        raise RuntimeError("Document preprocessor returned no results")
 
     doc_result = result[0]
     output_img = doc_result.get("output_img")
     if output_img is None:
-        raise RuntimeError("文档矫正结果缺少 output_img")
+        raise RuntimeError("Document preprocessor result missing output_img")
 
     doc_meta = {
         "input_path": None,
@@ -75,7 +75,7 @@ def _run_ocr(image: Any, use_doc_preprocessor: bool = False):
     return serialized
 
 
-@router.get('/predict-by-path', response_model=RestfulModel, summary="识别本地图片")
+@router.get('/predict-by-path', response_model=RestfulModel, summary="Recognize image from path")
 def predict_by_path(image_path: str, use_doc_preprocessor: bool = False):
     result = _run_ocr(image_path, use_doc_preprocessor=use_doc_preprocessor)
     restfulModel = RestfulModel(
@@ -83,7 +83,7 @@ def predict_by_path(image_path: str, use_doc_preprocessor: bool = False):
     return restfulModel
 
 
-@router.post('/predict-by-base64', response_model=RestfulModel, summary="识别 Base64 数据")
+@router.post('/predict-by-base64', response_model=RestfulModel, summary="Recognize Base64 data")
 def predict_by_base64(base64model: Base64PostModel, use_doc_preprocessor: bool = False):
     img = base64_to_ndarray(base64model.base64_str)
     result = _run_ocr(img, use_doc_preprocessor=use_doc_preprocessor)
@@ -92,7 +92,7 @@ def predict_by_base64(base64model: Base64PostModel, use_doc_preprocessor: bool =
     return restfulModel
 
 
-@router.post('/predict-by-file', response_model=RestfulModel, summary="识别上传文件")
+@router.post('/predict-by-file', response_model=RestfulModel, summary="Recognize uploaded file")
 async def predict_by_file(file: UploadFile, use_doc_preprocessor: bool = Form(False)):
     restfulModel: RestfulModel = RestfulModel()
     if file.filename.endswith((".jpg", ".png")):
@@ -105,12 +105,12 @@ async def predict_by_file(file: UploadFile, use_doc_preprocessor: bool = Form(Fa
     else:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="请上传 .jpg 或 .png 格式图片"
+            detail="Please upload .jpg or .png format images"
         )
     return restfulModel
 
 
-@router.get('/predict-by-url', response_model=RestfulModel, summary="识别图片 URL")
+@router.get('/predict-by-url', response_model=RestfulModel, summary="Recognize image from URL")
 async def predict_by_url(imageUrl: str, use_doc_preprocessor: bool = False):
     restfulModel: RestfulModel = RestfulModel()
     response = requests.get(imageUrl)
@@ -124,6 +124,6 @@ async def predict_by_url(imageUrl: str, use_doc_preprocessor: bool = False):
     else:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="请上传 .jpg 或 .png 格式图片"
+            detail="Please upload .jpg or .png format images"
         )
     return restfulModel

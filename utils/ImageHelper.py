@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 
 import base64
 
@@ -7,10 +7,10 @@ import numpy as np
 
 
 def base64_to_ndarray(b64_data: str):
-    """base64转numpy数组
+    """Convert base64 to numpy array
 
     Args:
-        b64_data (str): base64数据
+        b64_data (str): base64 data
 
     Returns:
         _type_: _description_
@@ -22,10 +22,10 @@ def base64_to_ndarray(b64_data: str):
 
 
 def bytes_to_ndarray(img_bytes: str):
-    """字节转numpy数组
+    """Convert bytes to numpy array
 
     Args:
-        img_bytes (str): 图片字节
+        img_bytes (str): image bytes
 
     Returns:
         _type_: _description_
