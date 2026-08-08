@@ -117,7 +117,7 @@ def _validate_model_dir(model_name: str, model_dir: Path) -> None:
     ]
     if missing:
         missing_text = ", ".join(missing)
-raise FileNotFoundError(
+        raise FileNotFoundError(
             f"Offline model {model_name} is incomplete: {model_dir} missing {missing_text}. "
             "Please run `uv run python -m scripts.prepare_models` in a connected environment, "
             "then copy the project directory to the target machine."
