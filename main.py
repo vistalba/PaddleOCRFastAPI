@@ -15,6 +15,7 @@ from models import TaskModel  # noqa: F401 – ensure table is registered before
 from routers import ocr
 from routers import tasks
 from routers.tasks import _ai_pool, _ocr_pool, start_workers, stop_workers
+from azure_api import router as azure_compatibility_router
 from schema_migrations import ensure_task_page_organization_columns
 from utils.ImageHelper import *
 
@@ -63,5 +64,6 @@ app.add_middleware(
 
 app.include_router(ocr.router)
 app.include_router(tasks.router)
+app.include_router(azure_compatibility_router)
 
 # uvicorn.run(app=app, host="0.0.0.0", port=48301)
