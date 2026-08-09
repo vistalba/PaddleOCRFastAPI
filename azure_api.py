@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse, Response
 from reportlab.pdfgen import canvas
 from reportlab.lib.colors import Color
 from pypdf import PdfReader, PdfWriter
+from config import FORCE_OCR_FOR_AZURE
 
 router = APIRouter()
 
@@ -50,6 +51,22 @@ def create_searchable_pdf_layer(
         cells = paddle_page_data.get("cells", [])
         if not cells and "lines" in paddle_page_data:
             cells = paddle_page_data.get("lines", [])
+        
+        # Also try to extract from ocr_result if no cells/lines available
+        if not cells:
+            ocr_result = paddle_page_data.get("ocr_result", [])
+            if isinstance(ocr_result, list):
+                for item in ocr_result:
+                    if isinstance(item, dict):
+                        texts = item.get("rec_texts", [])
+                        boxes = item.get("rec_boxes", [])
+                        if isinstance(texts, list) and isinstance(boxes, list):
+                            for i, text in enumerate(texts):
+                                if text and i < len(boxes):
+                                    cells.append({
+                                        "text": text if isinstance(text, str) else str(text),
+                                        "box": boxes[i] if isinstance(boxes[i], list) else []
+                                    })
 
         for cell in cells:
             if isinstance(cell, str):
@@ -110,8 +127,9 @@ async def azure_submit_document(request: Request, api_version: str = "2024-11-30
 
         async with httpx.AsyncClient(timeout=30.0) as client:
             files = {"file": ("document.pdf", file_bytes, "application/pdf")}
+            data = {"force_ocr": "true"} if FORCE_OCR_FOR_AZURE else {}
             response = await client.post(
-                f"{PADDLE_BASE_URL}/ocr/tasks", files=files
+                f"{PADDLE_BASE_URL}/ocr/tasks", files=files, data=data
             )
 
             if response.status_code not in [200, 202]:

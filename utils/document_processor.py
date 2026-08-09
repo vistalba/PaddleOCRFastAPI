@@ -87,7 +87,7 @@ def _render_pdf_page(page: Any, output_path: Path) -> tuple[int, int]:
         bitmap.close()
 
 
-def _prepare_pdf(source_path: Path, task_dir: Path) -> list[dict[str, Any]]:
+def _prepare_pdf(source_path: Path, task_dir: Path, force_ocr: bool = False) -> list[dict[str, Any]]:
     try:
         document = pdfium.PdfDocument(str(source_path))
     except pdfium.PdfiumError as exc:
@@ -149,9 +149,9 @@ def _prepare_pdf(source_path: Path, task_dir: Path) -> list[dict[str, Any]]:
                 original_path = page_dir / "original.png"
                 width, height = _render_pdf_page(page, original_path)
                 processing_method = (
-                    "native_text"
-                    if should_use_native_pdf_text(native_text)
-                    else "ocr"
+                    "ocr"
+                    if force_ocr or not should_use_native_pdf_text(native_text)
+                    else "native_text"
                 )
                 pages.append(
                     {
@@ -211,7 +211,7 @@ def _prepare_image(source_path: Path) -> list[dict[str, Any]]:
     ]
 
 
-def prepare_document_file(source_path: str) -> dict[str, Any]:
+def prepare_document_file(source_path: str, force_ocr: bool = False) -> dict[str, Any]:
     """Prepare an uploaded source file inside a process-pool worker."""
     path = Path(source_path)
     if not path.is_file():
@@ -220,7 +220,7 @@ def prepare_document_file(source_path: str) -> dict[str, Any]:
     file_type = "pdf" if path.suffix.lower() == ".pdf" else "image"
     task_dir = path.parent
     pages = (
-        _prepare_pdf(path, task_dir)
+        _prepare_pdf(path, task_dir, force_ocr)
         if file_type == "pdf"
         else _prepare_image(path)
     )

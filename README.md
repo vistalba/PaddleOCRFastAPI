@@ -69,6 +69,21 @@ PAPERLESS_OCR_AZURE_ENDPOINT=http://your-server:8000
 PAPERLESS_OCR_AZURE_API_VERSION=2024-11-30
 ```
 
+### Force OCR Configuration
+
+By default, the Azure compatibility layer uses native PDF text if available. To force OCR on all PDFs (even those with existing text layers), set:
+
+```dotenv
+FORCE_OCR_FOR_AZURE=true
+```
+
+This ensures that PaddleOCR processes all PDFs as images and creates a new text layer with proper bounding box positioning.
+
+**Restart required**: After changing this setting, restart the container:
+```bash
+docker restart paddle_ocr_azureai_test
+```
+
 ## Image and PDF Tasks
 
 `POST /ocr/tasks` remains a single-file upload endpoint:
