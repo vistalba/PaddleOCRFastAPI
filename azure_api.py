@@ -221,10 +221,10 @@ async def azure_get_status(task_id: str, api_version: str = "2024-11-30"):
                     {
                         "pageNumber": page_num,
                         "angle": 0,
-                        # Convert PDF points to inches for Azure compatibility
-                    "width": page.get("pdf_width_pts", page.get("width", 576)) / 72.0,
-                    "height": page.get("pdf_height_pts", page.get("height", 820)) / 72.0,
-                    "unit": "inch",
+                        # Read actual PDF page dimensions from the original PDF
+                        "width": page_reader.pages[0].mediabox.width / 72.0,
+                        "height": page_reader.pages[0].mediabox.height / 72.0,
+                        "unit": "inch",
                         "lines": [{"content": l} for l in page_text_lines],
                     }
                 )

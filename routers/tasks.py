@@ -115,6 +115,9 @@ class TaskPageResponse(BaseModel):
     ai_processed_at: Optional[datetime] = None
     ai_error: Optional[str] = None
     error_msg: Optional[str] = None
+    pdf_width_pts: Optional[int] = None
+    pdf_height_pts: Optional[int] = None
+    render_scale: Optional[float] = None
 
 
 class TaskDetailResponse(BaseModel):
@@ -540,6 +543,9 @@ def _build_page_response(
         ai_processed_at=page.ai_processed_at,
         ai_error=page.ai_error,
         error_msg=page.error_msg,
+        pdf_width_pts=page.pdf_width_pts if include_result else None,
+        pdf_height_pts=page.pdf_height_pts if include_result else None,
+        render_scale=page.render_scale if include_result else None,
     )
 
 
