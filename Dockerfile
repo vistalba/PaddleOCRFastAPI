@@ -35,9 +35,9 @@ RUN sed -i "s@http://deb.debian.org@http://mirrors.tuna.tsinghua.edu.cn@g" /etc/
 
 RUN python3 -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple --no-cache-dir --upgrade pip uv && \
     if [ "${INSTALL_AI}" = "true" ]; then \
-        uv sync --frozen --no-dev --no-install-project --extra ai; \
+        uv sync --frozen --no-dev --extra ai; \
     else \
-        uv sync --frozen --no-dev --no-install-project; \
+        uv sync --frozen --no-dev; \
     fi
 
 COPY . /app
