@@ -26,6 +26,11 @@ PDF_NATIVE_TEXT_MIN_CHARS: int = int(
     os.getenv("PDF_NATIVE_TEXT_MIN_CHARS", "20")
 )
 
+# OCR rendering DPI (dots per inch) for image-based OCR
+# Higher DPI = better accuracy but slower processing
+# Range: 72-600, Default: 300 (recommended by PaddleOCR)
+OCR_DPI: int = max(72, min(600, int(os.getenv("OCR_DPI", "300"))))
+
 # Optional local GGUF text organizer model. When not configured, only coordinate-based rule organization is enabled.
 AI_TEXT_MODEL_PATH: str = os.getenv("AI_TEXT_MODEL_PATH", "").strip()
 AI_TEXT_MODEL_NAME: str = os.getenv("AI_TEXT_MODEL_NAME", "").strip()

@@ -71,17 +71,35 @@ PAPERLESS_OCR_AZURE_API_VERSION=2024-11-30
 
 ### Force OCR Configuration
 
-By default, the Azure compatibility layer uses native PDF text if available. To force OCR on all PDFs (even those with existing text layers), set:
+By default, the Azure compatibility layer uses native PDF text if available. To force OCR on all PDFs:
 
 ```dotenv
 FORCE_OCR_FOR_AZURE=true
 ```
 
-This ensures that PaddleOCR processes all PDFs as images and creates a new text layer with proper bounding box positioning.
+### OCR Quality Configuration
 
-**Restart required**: After changing this setting, restart the container:
+The OCR quality can be configured via the `OCR_DPI` environment variable:
+
+```dotenv
+OCR_DPI=300  # Default: 300 DPI (high quality)
+```
+
+**Available values**: 72-600 DPI (default: 300)
+
+**Impact**:
+- Higher DPI = better OCR accuracy but slower processing
+- Scale factor = `OCR_DPI / 72` (PDF native DPI is 72)
+- 300 DPI → 4.17x scale (recommended by PaddleOCR)
+- 150 DPI → 2.08x scale (faster, good quality)
+
+**Example**:
 ```bash
-docker restart paddle_ocr_azureai_test
+# Run with 150 DPI for faster processing
+docker run -e OCR_DPI=150 vistalba/paddleocrfastapi:test-azureai
+
+# Run with 300 DPI for maximum accuracy
+docker run -e OCR_DPI=300 vistalba/paddleocrfastapi:test-azureai
 ```
 
 ## Image and PDF Tasks

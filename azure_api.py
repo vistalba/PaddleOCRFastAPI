@@ -26,14 +26,8 @@ def create_searchable_pdf_layer(
     """
     Translates PaddleOCR text line bounding boxes to PDF coordinate system
     and creates invisible text layer overlay.
-
-    Args:
-        paddle_page_data: PaddleOCR response for single page
-        original_pdf_bytes: Original PDF file bytes
-        page_index: Zero-based page index
-
-    Returns:
-        Modified PDF bytes with searchable text layer
+    
+    NOTE: Boxes are now in PDF point coordinates (72 DPI), not image pixels.
     """
     try:
         input_pdf = PdfReader(io.BytesIO(original_pdf_bytes))
@@ -41,11 +35,11 @@ def create_searchable_pdf_layer(
             return original_pdf_bytes
 
         orig_page = input_pdf.pages[page_index]
-        width = float(orig_page.mediabox.width)
-        height = float(orig_page.mediabox.height)
+        pdf_width = float(orig_page.mediabox.width)
+        pdf_height = float(orig_page.mediabox.height)
 
         packet = io.BytesIO()
-        can = canvas.Canvas(packet, pagesize=(width, height))
+        can = canvas.Canvas(packet, pagesize=(pdf_width, pdf_height))
         can.setFillColor(Color(0, 0, 0, alpha=0))
 
         cells = paddle_page_data.get("cells", [])
@@ -55,7 +49,9 @@ def create_searchable_pdf_layer(
         # Also try to extract from ocr_result if no cells/lines available
         if not cells:
             ocr_result = paddle_page_data.get("ocr_result", [])
-            if isinstance(ocr_result, list):
+            render_scale = paddle_page_data.get("render_scale", 1.0)
+            if isinstance(ocr_result, list) and render_scale > 1.0:
+                # Transform boxes to PDF coordinates
                 for item in ocr_result:
                     if isinstance(item, dict):
                         texts = item.get("rec_texts", [])
@@ -63,9 +59,11 @@ def create_searchable_pdf_layer(
                         if isinstance(texts, list) and isinstance(boxes, list):
                             for i, text in enumerate(texts):
                                 if text and i < len(boxes):
+                                    # Transform from image pixels to PDF points
+                                    transformed_box = [coord / render_scale for coord in boxes[i]]
                                     cells.append({
                                         "text": text if isinstance(text, str) else str(text),
-                                        "box": boxes[i] if isinstance(boxes[i], list) else []
+                                        "box": transformed_box
                                     })
 
         for cell in cells:
@@ -76,6 +74,7 @@ def create_searchable_pdf_layer(
             text = cell.get("text") or cell.get("content") or ""
 
             if text and len(box) >= 4:
+                # Boxes are now in PDF point coordinates, no transformation needed
                 x_coords = [pt for pt in box if isinstance(pt, (int, float))]
 
                 if len(x_coords) < 4:
@@ -85,7 +84,8 @@ def create_searchable_pdf_layer(
                 y_max = max(x_coords[1:3]) if len(x_coords) > 2 else max(x_coords)
                 y_min = min(x_coords[1:3]) if len(x_coords) > 2 else min(x_coords)
 
-                pdf_y = height - y_max
+                # PDF coordinates: origin at bottom-left
+                pdf_y = pdf_height - y_max
                 font_size = max(8, y_max - y_min)
 
                 can.setFont("Helvetica", font_size)
@@ -221,9 +221,10 @@ async def azure_get_status(task_id: str, api_version: str = "2024-11-30"):
                     {
                         "pageNumber": page_num,
                         "angle": 0,
-                        "width": page.get("width", 8.5),
-                        "height": page.get("height", 11),
-                        "unit": "inch",
+                        # Convert PDF points to inches for Azure compatibility
+                    "width": page.get("pdf_width_pts", page.get("width", 576)) / 72.0,
+                    "height": page.get("pdf_height_pts", page.get("height", 820)) / 72.0,
+                    "unit": "inch",
                         "lines": [{"content": l} for l in page_text_lines],
                     }
                 )
