@@ -114,7 +114,7 @@ async def azure_submit_document(request: Request, api_version: str = "2024-11-30
                 f"{PADDLE_BASE_URL}/ocr/tasks", files=files
             )
 
-            if response.status_code != 200:
+            if response.status_code not in [200, 202]:
                 return JSONResponse(
                     status_code=500,
                     content={"error": "PaddleOCR task scheduling failed"},
