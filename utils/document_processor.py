@@ -159,8 +159,7 @@ def _prepare_pdf(source_path: Path, task_dir: Path, force_ocr: bool = False) -> 
                     native_text = ""
 
                 # Get PDF page dimensions in points (PDF native coordinate system)
-                page_width_pts = page.mediabox.width
-                page_height_pts = page.mediabox.height
+                page_width_pts, page_height_pts = page.get_size()
 
                 page_dir = task_dir / "pages" / f"page_{page_index + 1:04d}"
                 original_path = page_dir / "original.png"
