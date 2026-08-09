@@ -59,7 +59,7 @@ class TaskPage(Base):
     page_index = Column(Integer, nullable=False)
     status = Column(String(20), nullable=False, default="queued")
     processing_method = Column(String(20), nullable=False, default="ocr")
-width = Column(Integer, nullable=True)
+    width = Column(Integer, nullable=True)
     height = Column(Integer, nullable=True)
     original_image_path = Column(String(512), nullable=True)
     corrected_image_path = Column(String(512), nullable=True)
