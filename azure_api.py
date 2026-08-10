@@ -74,22 +74,28 @@ def create_searchable_pdf_layer(
             text = cell.get("text") or cell.get("content") or ""
 
             if text and len(box) >= 4:
-                # Boxes are now in PDF point coordinates, no transformation needed
-                x_coords = [pt for pt in box if isinstance(pt, (int, float))]
-
-                if len(x_coords) < 4:
+                # Box format from PaddleOCR: [left, top, right, bottom]
+                # Convert to floats
+                try:
+                    left = float(box[0])
+                    top = float(box[1])
+                    right = float(box[2])
+                    bottom = float(box[3])
+                except (ValueError, TypeError):
                     continue
 
-                x_min = min(x_coords[:2])
-                y_max = max(x_coords[1:3]) if len(x_coords) > 2 else max(x_coords)
-                y_min = min(x_coords[1:3]) if len(x_coords) > 2 else min(x_coords)
+                # Validate coordinates
+                if right < left or bottom < top:
+                    continue
 
-                # PDF coordinates: origin at bottom-left
-                pdf_y = pdf_height - y_max
-                font_size = max(8, y_max - y_min)
+                # PDF coordinates: origin at bottom-left, image origin at top-left
+                # Convert y coordinates: pdf_y = pdf_height - y_image
+                pdf_x = left
+                pdf_y = pdf_height - bottom
+                font_size = max(8, bottom - top)
 
                 can.setFont("Helvetica", font_size)
-                can.drawString(x_min, pdf_y, text)
+                can.drawString(pdf_x, pdf_y, text)
 
         can.save()
         packet.seek(0)
