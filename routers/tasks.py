@@ -115,8 +115,8 @@ class TaskPageResponse(BaseModel):
     ai_processed_at: Optional[datetime] = None
     ai_error: Optional[str] = None
     error_msg: Optional[str] = None
-    pdf_width_pts: Optional[int] = None
-    pdf_height_pts: Optional[int] = None
+    pdf_width_pts: Optional[float] = None
+    pdf_height_pts: Optional[float] = None
     render_scale: Optional[float] = None
 
 

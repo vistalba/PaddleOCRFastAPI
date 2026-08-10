@@ -66,8 +66,8 @@ class TaskPage(Base):
     corrected_image_path = Column(String(512), nullable=True)
     native_text = Column(large_text_type, nullable=True)
     # PDF metadata for coordinate transformation
-    pdf_width_pts = Column(Integer, nullable=True)  # PDF width in points (72 DPI)
-    pdf_height_pts = Column(Integer, nullable=True)  # PDF height in points
+    pdf_width_pts = Column(Float, nullable=True)  # PDF width in points (72 DPI)
+    pdf_height_pts = Column(Float, nullable=True)  # PDF height in points
     render_scale = Column(Float, nullable=True)  # Scale factor used for rendering
     ocr_result = Column(large_text_type, nullable=True)
     rule_result = Column(large_text_type, nullable=True)

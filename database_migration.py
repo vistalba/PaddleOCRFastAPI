@@ -22,8 +22,8 @@ def migrate_database(db_path: str) -> None:
 
         # Columns to add
         columns_to_add = [
-            ("pdf_width_pts", "INTEGER"),
-            ("pdf_height_pts", "INTEGER"),
+            ("pdf_width_pts", "FLOAT"),
+            ("pdf_height_pts", "FLOAT"),
             ("render_scale", "FLOAT"),
         ]
 
