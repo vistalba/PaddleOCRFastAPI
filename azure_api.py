@@ -32,33 +32,41 @@ def create_searchable_pdf_layer(
     import logging
     logger = logging.getLogger(__name__)
     
+    logger.info(f"=== PAGE {page_index} DEBUG ===")
+    logger.info(f"Page {page_index}: Starting create_searchable_pdf_layer")
+    
     try:
         input_pdf = PdfReader(io.BytesIO(original_pdf_bytes))
+        logger.info(f"Page {page_index}: Loaded original PDF with {len(input_pdf.pages)} pages")
+        
         if page_index >= len(input_pdf.pages):
+            logger.warning(f"Page {page_index}: Index out of range, returning original PDF")
             return original_pdf_bytes
 
         orig_page = input_pdf.pages[page_index]
         pdf_width = float(orig_page.mediabox.width)
         pdf_height = float(orig_page.mediabox.height)
-        
-        logger.info(f"=== PAGE {page_index} DEBUG ===")
-        logger.info(f"PDF dimensions: {pdf_width:.2f} x {pdf_height:.2f} points")
+        logger.info(f"Page {page_index}: PDF dimensions: {pdf_width:.2f} x {pdf_height:.2f} points")
 
         packet = io.BytesIO()
         can = canvas.Canvas(packet, pagesize=(pdf_width, pdf_height))
         can.setFillColor(Color(0, 0, 0, alpha=0))
+        logger.info(f"Page {page_index}: Created canvas for text layer")
+        
+        skipped_count = 0
+        drawn_count = 0
 
         cells = paddle_page_data.get("cells", [])
         if not cells and "lines" in paddle_page_data:
             cells = paddle_page_data.get("lines", [])
         
-        logger.info(f"Data source: cells={len(cells)}, has_lines={'lines' in paddle_page_data}, has_ocr_result={'ocr_result' in paddle_page_data}")
+        logger.info(f"Page {page_index}: Data source: cells={len(cells)}, has_lines={'lines' in paddle_page_data}, has_ocr_result={'ocr_result' in paddle_page_data}")
         
         # Also try to extract from ocr_result if no cells/lines available
         if not cells:
             ocr_result = paddle_page_data.get("ocr_result", [])
             render_scale = paddle_page_data.get("render_scale", 1.0)
-            logger.info(f"Using ocr_result: render_scale={render_scale}, ocr_result_len={len(ocr_result) if isinstance(ocr_result, list) else 0}")
+            logger.info(f"Page {page_index}: Using ocr_result: render_scale={render_scale}, ocr_result_len={len(ocr_result) if isinstance(ocr_result, list) else 0}")
             if isinstance(ocr_result, list) and render_scale > 1.0:
                 # Transform boxes to PDF coordinates
                 for item in ocr_result:
@@ -74,10 +82,15 @@ def create_searchable_pdf_layer(
                                         "text": text if isinstance(text, str) else str(text),
                                         "box": transformed_box
                                     })
-                logger.info(f"Created {len(cells)} cells from ocr_result")
+                logger.info(f"Page {page_index}: Created {len(cells)} cells from ocr_result")
+        
+        logger.info(f"Page {page_index}: Processing {len(cells)} text cells")
+        drawn_count = 0
+        skipped_count = 0
 
         for cell in cells:
             if isinstance(cell, str):
+                skipped_count += 1
                 continue
 
             box = cell.get("box", [])
@@ -92,13 +105,15 @@ def create_searchable_pdf_layer(
                     top = float(box[1])      # Top edge (smaller y in image coords)
                     right = float(box[2])
                     bottom = float(box[3])   # Bottom edge (larger y in image coords)
-                except (ValueError, TypeError):
-                    logger.warning(f"Page {page_index}: Invalid box format for text '{text[:30]}'")
+                except (ValueError, TypeError) as e:
+                    logger.warning(f"Page {page_index}: Invalid box format for text '{text[:30]}': {e}")
+                    skipped_count += 1
                     continue
 
                 # Validate coordinates
                 if right < left or bottom < top:
                     logger.warning(f"Page {page_index}: Invalid coordinates for text '{text[:30]}': left={left}, top={top}, right={right}, bottom={bottom}")
+                    skipped_count += 1
                     continue
 
                 # Convert to PDF coordinates (origin at bottom-left, y increases upward)
@@ -108,26 +123,44 @@ def create_searchable_pdf_layer(
                 font_size = max(8, bottom - top)
 
                 # Debug: Log first 3 lines of each page
-                if cells.index(cell) < 3:
-                    logger.info(f"Page {page_index} line {cells.index(cell)+1}: text='{text[:40]}', box=[{left:.2f}, {top:.2f}, {right:.2f}, {bottom:.2f}], pdf_pos=({pdf_x:.2f}, {pdf_y:.2f}), font_size={font_size:.1f}")
+                cell_index = cells.index(cell)
+                if cell_index < 3:
+                    logger.info(f"Page {page_index} line {cell_index+1}: text='{text[:40]}', box=[{left:.2f}, {top:.2f}, {right:.2f}, {bottom:.2f}], pdf_pos=({pdf_x:.2f}, {pdf_y:.2f}), font_size={font_size:.1f}")
 
-                can.setFont("Helvetica", font_size)
-                can.drawString(pdf_x, pdf_y, text)
+                try:
+                    can.setFont("Helvetica", font_size)
+                    can.drawString(pdf_x, pdf_y, text)
+                    drawn_count += 1
+                    if cell_index < 3:
+                        logger.info(f"Page {page_index} line {cell_index+1}: Successfully drew text at ({pdf_x:.2f}, {pdf_y:.2f})")
+                except Exception as e:
+                    logger.error(f"Page {page_index}: drawString failed for '{text[:50]}': {e}")
+                    skipped_count += 1
+            else:
+                skipped_count += 1
+        
+        logger.info(f"Page {page_index}: Processing complete - drew {drawn_count} cells, skipped {skipped_count}")
 
         can.save()
         packet.seek(0)
+        logger.info(f"Page {page_index}: Saved canvas to packet")
 
         mask_pdf = PdfReader(packet)
+        logger.info(f"Page {page_index}: Loaded mask PDF with {len(mask_pdf.pages)} pages")
         orig_page.merge_page(mask_pdf.pages[0])
+        logger.info(f"Page {page_index}: Merged text layer with original page")
 
         output_writer = PdfWriter()
         output_writer.add_page(orig_page)
+        logger.info(f"Page {page_index}: Added page to output writer")
 
         output_stream = io.BytesIO()
         output_writer.write(output_stream)
+        logger.info(f"Page {page_index}: Successfully created searchable PDF layer")
         return output_stream.getvalue()
 
-    except Exception:
+    except Exception as e:
+        logger.error(f"Page {page_index}: Exception in create_searchable_pdf_layer: {e}", exc_info=True)
         return original_pdf_bytes
 
 
