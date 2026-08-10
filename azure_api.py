@@ -29,6 +29,9 @@ def create_searchable_pdf_layer(
     
     NOTE: Boxes are now in PDF point coordinates (72 DPI), not image pixels.
     """
+    import logging
+    logger = logging.getLogger(__name__)
+    
     try:
         input_pdf = PdfReader(io.BytesIO(original_pdf_bytes))
         if page_index >= len(input_pdf.pages):
@@ -37,6 +40,9 @@ def create_searchable_pdf_layer(
         orig_page = input_pdf.pages[page_index]
         pdf_width = float(orig_page.mediabox.width)
         pdf_height = float(orig_page.mediabox.height)
+        
+        logger.info(f"=== PAGE {page_index} DEBUG ===")
+        logger.info(f"PDF dimensions: {pdf_width:.2f} x {pdf_height:.2f} points")
 
         packet = io.BytesIO()
         can = canvas.Canvas(packet, pagesize=(pdf_width, pdf_height))
@@ -46,10 +52,13 @@ def create_searchable_pdf_layer(
         if not cells and "lines" in paddle_page_data:
             cells = paddle_page_data.get("lines", [])
         
+        logger.info(f"Data source: cells={len(cells)}, has_lines={'lines' in paddle_page_data}, has_ocr_result={'ocr_result' in paddle_page_data}")
+        
         # Also try to extract from ocr_result if no cells/lines available
         if not cells:
             ocr_result = paddle_page_data.get("ocr_result", [])
             render_scale = paddle_page_data.get("render_scale", 1.0)
+            logger.info(f"Using ocr_result: render_scale={render_scale}, ocr_result_len={len(ocr_result) if isinstance(ocr_result, list) else 0}")
             if isinstance(ocr_result, list) and render_scale > 1.0:
                 # Transform boxes to PDF coordinates
                 for item in ocr_result:
@@ -65,6 +74,7 @@ def create_searchable_pdf_layer(
                                         "text": text if isinstance(text, str) else str(text),
                                         "box": transformed_box
                                     })
+                logger.info(f"Created {len(cells)} cells from ocr_result")
 
         for cell in cells:
             if isinstance(cell, str):
@@ -74,25 +84,32 @@ def create_searchable_pdf_layer(
             text = cell.get("text") or cell.get("content") or ""
 
             if text and len(box) >= 4:
-                # Box format from PaddleOCR: [left, top, right, bottom]
-                # Convert to floats
+                # Box format: [left, top, right, bottom]
+                # These coordinates are in PDF points, but y-axis is still image-based
+                # (origin at top-left, y increases downward)
                 try:
                     left = float(box[0])
-                    top = float(box[1])
+                    top = float(box[1])      # Top edge (smaller y in image coords)
                     right = float(box[2])
-                    bottom = float(box[3])
+                    bottom = float(box[3])   # Bottom edge (larger y in image coords)
                 except (ValueError, TypeError):
+                    logger.warning(f"Page {page_index}: Invalid box format for text '{text[:30]}'")
                     continue
 
                 # Validate coordinates
                 if right < left or bottom < top:
+                    logger.warning(f"Page {page_index}: Invalid coordinates for text '{text[:30]}': left={left}, top={top}, right={right}, bottom={bottom}")
                     continue
 
-                # PDF coordinates: origin at bottom-left, image origin at top-left
-                # Convert y coordinates: pdf_y = pdf_height - y_image
+                # Convert to PDF coordinates (origin at bottom-left, y increases upward)
+                # PDF y = pdf_height - image_y
                 pdf_x = left
                 pdf_y = pdf_height - bottom
                 font_size = max(8, bottom - top)
+
+                # Debug: Log first 3 lines of each page
+                if cells.index(cell) < 3:
+                    logger.info(f"Page {page_index} line {cells.index(cell)+1}: text='{text[:40]}', box=[{left:.2f}, {top:.2f}, {right:.2f}, {bottom:.2f}], pdf_pos=({pdf_x:.2f}, {pdf_y:.2f}), font_size={font_size:.1f}")
 
                 can.setFont("Helvetica", font_size)
                 can.drawString(pdf_x, pdf_y, text)
