@@ -122,42 +122,20 @@ def create_searchable_pdf_layer(
                 pdf_y = pdf_height - bottom
                 font_size = max(8, bottom - top)
 
-                # Calculate actual text width and compare with box width
+                # Debug: Log first 3 lines of each page
+                cell_index = cells.index(cell)
+                if cell_index < 3:
+                    logger.info(f"Page {page_index} line {cell_index+1}: text='{text[:40]}', box=[{left:.2f}, {top:.2f}, {right:.2f}, {bottom:.2f}], pdf_pos=({pdf_x:.2f}, {pdf_y:.2f}), font_size={font_size:.1f}")
+
                 try:
                     can.setFont("Helvetica", font_size)
-                    actual_text_width = can.stringWidth(text, "Helvetica", font_size)
-                    box_width = right - left
-                    width_diff = actual_text_width - box_width
-                    
-                    # If text is significantly wider than box, adjust X position
-                    # This handles cases where PaddleOCR box is too narrow
-                    if width_diff > 5:  # Text is more than 5 points wider than box
-                        pdf_x = left - width_diff
-                        logger.info(f"Page {page_index}: Adjusted X for '{text[:20]}': box_width={box_width:.1f}, actual_width={actual_text_width:.1f}, diff={width_diff:.1f}")
-                    
-                    # Debug: Log first 3 lines of each page
-                    cell_index = cells.index(cell)
+                    can.drawString(pdf_x, pdf_y, text)
+                    drawn_count += 1
                     if cell_index < 3:
-                        logger.info(f"Page {page_index} line {cell_index+1}: text='{text[:40]}', box=[{left:.2f}, {top:.2f}, {right:.2f}, {bottom:.2f}], pdf_pos=({pdf_x:.2f}, {pdf_y:.2f}), font_size={font_size:.1f}, actual_width={actual_text_width:.1f}")
-
-                    try:
-                        can.drawString(pdf_x, pdf_y, text)
-                        drawn_count += 1
-                        if cell_index < 3:
-                            logger.info(f"Page {page_index} line {cell_index+1}: Successfully drew text at ({pdf_x:.2f}, {pdf_y:.2f})")
-                    except Exception as e:
-                        logger.error(f"Page {page_index}: drawString failed for '{text[:50]}': {e}")
-                        skipped_count += 1
+                        logger.info(f"Page {page_index} line {cell_index+1}: Successfully drew text at ({pdf_x:.2f}, {pdf_y:.2f})")
                 except Exception as e:
-                    logger.warning(f"Page {page_index}: Failed to calculate text width for '{text[:30]}': {e}, using original position")
-                    # Fallback: use original position
-                    try:
-                        can.setFont("Helvetica", font_size)
-                        can.drawString(left, pdf_y, text)
-                        drawn_count += 1
-                    except Exception as e2:
-                        logger.error(f"Page {page_index}: drawString failed for '{text[:50]}': {e2}")
-                        skipped_count += 1
+                    logger.error(f"Page {page_index}: drawString failed for '{text[:50]}': {e}")
+                    skipped_count += 1
             else:
                 skipped_count += 1
         
