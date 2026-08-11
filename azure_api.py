@@ -20,8 +20,93 @@ PADDLE_BASE_URL = f"http://127.0.0.1:{LOCAL_API_PORT}"
 TASK_STORAGE: dict[str, dict[str, Any]] = {}
 
 
+def _has_text_layer(orig_page) -> bool:
+    """
+    Check if a PDF page has any text content.
+    
+    Args:
+        orig_page: pypdf PageObject to check
+    
+    Returns:
+        True if page contains text operators, False otherwise
+    """
+    contents = orig_page.get_contents()
+    if contents is None:
+        return False
+    
+    content_data = contents.get_data()
+    
+    # Check for text operators in PDF content stream
+    import re
+    if re.search(rb'\s*BT\s+', content_data):  # Begin text operator
+        return True
+    if re.search(rb'\s*Tj\s+', content_data):  # Show text operator
+        return True
+    if re.search(rb'\s*TJ\s+', content_data):  # Show text array operator
+        return True
+    
+    return False
+
+
+def _remove_text_layer_from_page(orig_page) -> None:
+    """
+    Remove all text content from a PDF page while preserving images and graphics.
+    
+    This function modifies the page in-place by removing text operators from
+    the content stream. The page retains all resources (images, fonts, etc.)
+    but will have no text content.
+    
+    Args:
+        orig_page: pypdf PageObject to modify
+    
+    Returns:
+        None (modifies page in-place)
+    """
+    from pypdf.generic import ContentStream, NameObject, ArrayObject
+    
+    contents = orig_page.get_contents()
+    if contents is None:
+        return
+    
+    content_data = contents.get_data()
+    
+    # Remove BT...ET blocks (text content blocks in PDF)
+    import re
+    cleaned_content = re.sub(
+        rb'\s*BT[\s\S]*?ET\s*',
+        b'',
+        content_data,
+        flags=re.DOTALL
+    )
+    
+    # Remove standalone text operators
+    text_operators = [
+        rb'\s*Tj\s+',
+        rb'\s*TJ\s+',
+        rb'\s*T\*\s+',
+        rb'\s*Td\s+',
+        rb'\s*TD\s+',
+        rb'\s*Tm\s+',
+        rb'\s*Tf\s+',
+    ]
+    
+    for operator in text_operators:
+        cleaned_content = re.sub(operator, b'', cleaned_content)
+    
+    # Set cleaned content back to page
+    if cleaned_content.strip():
+        new_content = ContentStream(None, None)
+        new_content.set_data(cleaned_content)
+        orig_page[NameObject("/Contents")] = new_content
+    else:
+        orig_page[NameObject("/Contents")] = ArrayObject([])
+
+
 def create_searchable_pdf_layer(
-    paddle_page_data: dict, original_pdf_bytes: bytes, page_index: int
+    paddle_page_data: dict, 
+    original_pdf_bytes: bytes, 
+    page_index: int,
+    force_ocr: bool = False
 ) -> bytes:
     """
     Translates PaddleOCR text line bounding boxes to PDF coordinate system
@@ -147,6 +232,17 @@ def create_searchable_pdf_layer(
 
         mask_pdf = PdfReader(packet)
         logger.info(f"Page {page_index}: Loaded mask PDF with {len(mask_pdf.pages)} pages")
+        
+        # Remove existing text layer if FORCE_OCR is enabled
+        if force_ocr:
+            logger.info(f"Page {page_index}: FORCE_OCR enabled, checking for existing text layer")
+            if _has_text_layer(orig_page):
+                logger.info(f"Page {page_index}: Existing text layer detected, removing it")
+                _remove_text_layer_from_page(orig_page)
+                logger.info(f"Page {page_index}: Existing text layer removed")
+            else:
+                logger.info(f"Page {page_index}: No existing text layer found")
+        
         orig_page.merge_page(mask_pdf.pages[0])
         logger.info(f"Page {page_index}: Merged text layer with original page")
 
@@ -202,6 +298,7 @@ async def azure_submit_document(request: Request, api_version: str = "2024-11-30
             "azure_json": None,
             "pdf_archive": None,
             "created_at": datetime.now(timezone.utc),
+            "force_ocr": FORCE_OCR_FOR_AZURE,
         }
 
         host_url = str(request.base_url).rstrip("/")
@@ -252,6 +349,9 @@ async def azure_get_status(task_id: str, api_version: str = "2024-11-30"):
 
             original_pdf = TASK_STORAGE[task_id]["raw_pdf"]
             final_pdf_writer = PdfWriter()
+            
+            # Get force_ocr flag from task storage
+            force_ocr = bool(TASK_STORAGE[task_id].get("force_ocr", False))
 
             pages = paddle_data.get("pages", [])
             for idx, page in enumerate(pages):
@@ -268,7 +368,7 @@ async def azure_get_status(task_id: str, api_version: str = "2024-11-30"):
                 full_text_blocks.append(page_full_text)
 
                 page_merged_bytes = create_searchable_pdf_layer(
-                    page, original_pdf, idx
+                    page, original_pdf, idx, force_ocr=force_ocr
                 )
                 page_reader = PdfReader(io.BytesIO(page_merged_bytes))
                 final_pdf_writer.add_page(page_reader.pages[0])
