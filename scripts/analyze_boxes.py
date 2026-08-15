@@ -63,20 +63,26 @@ def poll_task(task_id):
             print(f"❌ Task failed with status: {status}")
             return None
 
-def analyze_coordinate_transformation(task_data):
-    """Analyze coordinate transformation from image pixels to PDF points"""
-    print("\n" + "="*80)
-    print("📊 COORDINATE TRANSFORMATION ANALYSIS")
-    print("="*80 + "\n")
+def download_pdf(task_id, input_filename):
+    """Download the searchable PDF after processing completes."""
+    import os
+    base, ext = os.path.splitext(input_filename)
+    output_path = f"{base}_ocr{ext}"
 
-    # Get task ID from Azure response
-    task_id = task_data.get("analyzeResult", {}).get("pages", [{}])[0].get("pageNumber")
-    # We need to get the actual task_id from the Operation-Location or store it separately
-    # For now, let's try to extract it from the response
-    # Actually, we need to poll the PaddleOCR endpoint with the task_id we got earlier
-    
-    # This function will be called after we have the task_id
-    pass
+    print(f"\n📥 Downloading PDF...")
+    response = requests.get(
+        f"{BASE_URL}/documentintelligence/operations/{task_id}/pdf"
+    )
+
+    if response.status_code != 200:
+        print(f"❌ PDF download failed: {response.status_code}")
+        return None
+
+    with open(output_path, "wb") as f:
+        f.write(response.content)
+
+    print(f"💾 PDF saved to: {output_path}")
+    return output_path
 
 def main():
     if len(sys.argv) > 1:
@@ -93,6 +99,9 @@ def main():
     task_data = poll_task(task_id)
     if not task_data:
         return
+
+    # Download the searchable PDF
+    download_pdf(task_id, pdf_path)
 
     # Get task details from PaddleOCR endpoint
     task_response = requests.get(f"{BASE_URL}/ocr/tasks/{task_id}")
