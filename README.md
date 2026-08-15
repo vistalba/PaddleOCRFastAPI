@@ -83,14 +83,19 @@ PAPERLESS_REMOTE_OCR_ENDPOINT=http://your-server:8000
 PAPERLESS_REMOTE_OCR_API_KEY=unused
 ```
 
-> **Known upstream issue**: Paperless-ngx's `azureai` provider reads
-> `poller.details["operation_id"]`, an attribute that does not exist in any
-> `azure-core` release, so ingestion currently fails with an
-> `AttributeError` on the Paperless-ngx side (their unit tests mock the
-> attribute, which is why their CI passes). This endpoint is fully SDK
-> compatible; end-to-end ingestion works once Paperless-ngx ships the fix.
-> Until then, verify the API directly with the SDK client or the test script
-> below.
+The wire contract matches the `azure-ai-documentintelligence==1.0.2` SDK
+exactly (the version Paperless-ngx resolves), including the
+`poller.details["operation_id"]` lookup: the SDK's
+`AnalyzeDocumentLROPoller` parses the last path segment of the
+`Operation-Location` URL, which is this API's task id.
+
+To verify end-to-end with the real SDK (it replays Paperless-ngx's exact
+call sequence):
+
+```bash
+pip install azure-ai-documentintelligence==1.0.2
+python scripts/sdk_smoke_test.py ./test.pdf http://your-server:8000
+```
 
 ### Force OCR Configuration
 

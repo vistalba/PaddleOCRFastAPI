@@ -13,6 +13,7 @@ Run from the project root:
 """
 
 import base64
+import importlib.util
 import io
 
 import httpx
@@ -485,3 +486,104 @@ class TestArchivePdf:
         )
         assert response.status_code == 404
         assert response.json()["error"]["code"] == "ArchiveNotReady"
+
+
+def _serve_app(app):
+    """Serve an ASGI app on an ephemeral localhost port.
+
+    Returns:
+        ``(uvicorn.Server, base_url)`` - stop the server by setting
+        ``server.should_exit = True``.
+    """
+    import threading
+    import time
+
+    import uvicorn
+
+    config = uvicorn.Config(app, host="127.0.0.1", port=0, log_level="error")
+    server = uvicorn.Server(config)
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    for _ in range(100):
+        if server.started:
+            break
+        time.sleep(0.1)
+    port = server.servers[0].sockets[0].getsockname()[1]
+    return server, f"http://127.0.0.1:{port}"
+
+
+_SDK_AVAILABLE = importlib.util.find_spec("azure.ai.documentintelligence") is not None
+
+
+@pytest.mark.skipif(
+    not _SDK_AVAILABLE,
+    reason="azure-ai-documentintelligence not installed",
+)
+class TestRealSdk:
+    """End-to-end test with the real azure-ai-documentintelligence SDK.
+
+    Replays the exact call sequence of Paperless-ngx's azureai provider
+    (``src/paperless/parsers/remote.py``, ``_azure_ai_vision_parse``) against
+    the live app served over real HTTP: submit -> ``poller.wait()`` ->
+    ``poller.details["operation_id"]`` -> ``poller.result()`` ->
+    ``get_analyze_result_pdf``.
+    """
+
+    def test_paperless_ngx_flow(self, paddle_stub, monkeypatch):
+        state, stub_app = paddle_stub
+        lines = [{"text": "Hello World", "box": [72.0, 72.0, 200.0, 90.0]}]
+        state["statuses"] = [_task_payload("done", [_pdf_page(lines)], "pdf")]
+
+        app = FastAPI()
+        app.include_router(azure_router)
+
+        def fake_paddle_client(timeout: float) -> httpx.AsyncClient:
+            return httpx.AsyncClient(transport=httpx.ASGITransport(app=stub_app))
+
+        monkeypatch.setattr(azure_api, "_paddle_client", fake_paddle_client)
+        monkeypatch.setattr(azure_api, "TASK_STORAGE", {})
+
+        server, endpoint = _serve_app(app)
+        try:
+            from azure.ai.documentintelligence import DocumentIntelligenceClient
+            from azure.ai.documentintelligence.models import (
+                AnalyzeDocumentRequest,
+                AnalyzeOutputOption,
+                DocumentContentFormat,
+            )
+            from azure.core.credentials import AzureKeyCredential
+
+            client = DocumentIntelligenceClient(
+                endpoint=endpoint,
+                credential=AzureKeyCredential("unused"),
+            )
+            try:
+                poller = client.begin_analyze_document(
+                    model_id="prebuilt-read",
+                    body=AnalyzeDocumentRequest(bytes_source=_make_pdf()),
+                    output_content_format=DocumentContentFormat.TEXT,
+                    output=[AnalyzeOutputOption.PDF],
+                    content_type="application/json",
+                )
+                poller.wait()
+
+                # The SDK parses the last path segment of the
+                # Operation-Location URL - this API's task id.
+                result_id = poller.details["operation_id"]
+                assert result_id == TASK_ID
+
+                result = poller.result()
+                assert result.content == "Hello World"
+
+                archive = b"".join(
+                    client.get_analyze_result_pdf(
+                        model_id="prebuilt-read", result_id=result_id
+                    )
+                )
+                assert archive.startswith(b"%PDF-")
+                reader = PdfReader(io.BytesIO(archive))
+                assert "Hello World" in reader.pages[0].extract_text()
+            finally:
+                client.close()
+        finally:
+            server.should_exit = True

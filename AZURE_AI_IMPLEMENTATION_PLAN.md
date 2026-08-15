@@ -161,18 +161,26 @@ the `azure-ai-documentintelligence==1.0.2` Python SDK (used by Paperless-ngx's
    content-stream mutation (mutating reader pages is deprecated in pypdf 6.x
    and removed in 7.0)
 
-**Known external blocker (Paperless-ngx side)**:
+**End-to-end verification with the real SDK**:
 
 Paperless-ngx's `RemoteDocumentParser._azure_ai_vision_parse` reads
-`poller.details["operation_id"]`. `LROPoller.details` does not exist in any
-azure-core release (verified 1.20 - 1.38), so production raises
-`AttributeError` before the PDF download. Their unit tests mock the attribute
-(`mock_poller.details = {"operation_id": "fake-op-id"}`), so their CI does not
-catch it. This project waits for the upstream fix; until then, end-to-end runs
-through Paperless-ngx fail at that line regardless of this API's
-compatibility. The API itself can be verified directly with the SDK client
-(`DocumentIntelligenceClient.begin_analyze_document(model_id="prebuilt-read",
-document=...)` + `get_analyze_result_pdf`).
+`poller.details["operation_id"]`. This works: `details` is a property of the
+SDK's own `AnalyzeDocumentLROPoller` class (returned by
+`begin_analyze_document`), not of azure-core's base `LROPoller`. It parses
+the last path segment of the `Operation-Location` URL with the regex
+`[^:]+://[^/]+/documentintelligence/.+/([^?/]+)` - which is this API's task
+id. The API was verified end-to-end with the real
+`azure-ai-documentintelligence==1.0.2` client replaying Paperless-ngx's exact
+call sequence (submit -> `poller.wait()` -> `poller.details["operation_id"]`
+-> `poller.result()` -> `get_analyze_result_pdf`): all steps succeed and the
+archive PDF contains the extractable OCR text layer.
+
+To re-verify against a running instance:
+
+```bash
+pip install azure-ai-documentintelligence==1.0.2
+python scripts/sdk_smoke_test.py ./test.pdf http://your-server:8000
+```
 
 **Unit tests**: `tests/test_azure_api.py` (17 tests; the internal PaddleOCR API
 is stubbed in-process, so no OCR models or running server are required):

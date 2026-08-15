@@ -34,6 +34,10 @@ ai = [
 [dependency-groups]
 dev = [
     "pytest>=8.0",
+    # Pinned to the exact SDK version Paperless-ngx resolves to; used by
+    # tests/test_azure_api.py::TestRealSdk to verify the wire contract
+    # end-to-end.
+    "azure-ai-documentintelligence==1.0.2",
 ]
 
 [tool.pytest.ini_options]
