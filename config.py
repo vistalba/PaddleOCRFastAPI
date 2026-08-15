@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 
 import os
 from pathlib import Path
@@ -10,7 +10,7 @@ load_dotenv()
 DATABASE_URL: str = os.getenv("DATABASE_URL", "sqlite:///./ocr_tasks.db")
 UPLOAD_DIR: Path = Path(os.getenv("UPLOAD_DIR", "./uploads"))
 RATE_LIMIT: str = os.getenv("RATE_LIMIT", "10/minute")
-# 同时处理的 OCR 任务上限；其余任务排入 queued 等待队列
+# Maximum concurrent OCR tasks; remaining tasks are queued
 MAX_CONCURRENT_OCR: int = int(os.getenv("MAX_CONCURRENT_OCR", "1"))
 MAX_UPLOAD_SIZE_MB: int = int(os.getenv("MAX_UPLOAD_SIZE_MB", "50"))
 MAX_PDF_PAGES: int = int(os.getenv("MAX_PDF_PAGES", "50"))
@@ -26,7 +26,12 @@ PDF_NATIVE_TEXT_MIN_CHARS: int = int(
     os.getenv("PDF_NATIVE_TEXT_MIN_CHARS", "20")
 )
 
-# 可选的本地 GGUF 文本整理模型。未配置路径时仅启用坐标规则整理。
+# OCR rendering DPI (dots per inch) for image-based OCR
+# Higher DPI = better accuracy but slower processing
+# Range: 72-600, Default: 300 (recommended by PaddleOCR)
+OCR_DPI: int = max(72, min(600, int(os.getenv("OCR_DPI", "300"))))
+
+# Optional local GGUF text organizer model. When not configured, only coordinate-based rule organization is enabled.
 AI_TEXT_MODEL_PATH: str = os.getenv("AI_TEXT_MODEL_PATH", "").strip()
 AI_TEXT_MODEL_NAME: str = os.getenv("AI_TEXT_MODEL_NAME", "").strip()
 AI_TEXT_MODEL_CHAT_FORMAT: str = os.getenv(
@@ -44,10 +49,7 @@ AI_TEXT_MODEL_CONTEXT_SIZE: int = max(
 AI_TEXT_MODEL_THREADS: int = max(
     1,
     int(
-        os.getenv(
-            "AI_TEXT_MODEL_THREADS",
-            str(max(1, min(8, (os.cpu_count() or 2) // 2))),
-        )
+        int(os.getenv("AI_TEXT_MODEL_THREADS", "0")) or max(1, min(8, (os.cpu_count() or 2) // 2))
     ),
 )
 AI_TEXT_MODEL_GPU_LAYERS: int = int(
@@ -100,3 +102,6 @@ TEXT_RULE_HORIZONTAL_GAP_RATIO: float = max(
     1.0,
     float(os.getenv("TEXT_RULE_HORIZONTAL_GAP_RATIO", "3.0")),
 )
+
+# Force OCR for all PDF processing (even if PDF has native text)
+FORCE_OCR_FOR_AZURE: bool = os.getenv("FORCE_OCR_FOR_AZURE", "false").lower() == "true"

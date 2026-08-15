@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """Shared PaddleOCR runtime configuration for API and process-pool workers."""
 
 from __future__ import annotations
@@ -63,7 +63,7 @@ def load_runtime_config() -> OCRRuntimeConfig:
     if model_tier not in SUPPORTED_MODEL_TIERS:
         supported = ", ".join(sorted(SUPPORTED_MODEL_TIERS))
         raise ValueError(
-            f"不支持的 OCR_MODEL_TIER={model_tier!r}，可选值为: {supported}"
+            f"Unsupported OCR_MODEL_TIER={model_tier!r}，valid values are: {supported}"
         )
 
     raw_device = os.environ.get("OCR_DEVICE", "").strip()
@@ -118,9 +118,9 @@ def _validate_model_dir(model_name: str, model_dir: Path) -> None:
     if missing:
         missing_text = ", ".join(missing)
         raise FileNotFoundError(
-            f"离线模型 {model_name} 不完整: {model_dir} 缺少 {missing_text}。"
-            "请在联网环境运行 `uv run python -m scripts.prepare_models`，"
-            "再将项目目录完整复制到目标机器。"
+            f"Offline model {model_name} is incomplete: {model_dir} missing {missing_text}. "
+            "Please run `uv run python -m scripts.prepare_models` in a connected environment, "
+            "then copy the project directory to the target machine."
         )
 
 
@@ -158,8 +158,8 @@ def _device_kwargs(config: OCRRuntimeConfig) -> dict[str, Any]:
             or paddle.device.cuda.device_count() == 0
         ):
             raise RuntimeError(
-                f"OCR_DEVICE={config.device!r}，但当前环境没有可用的 Paddle CUDA GPU。"
-                "Windows 目标机必须安装 paddlepaddle-gpu，不能安装 CPU 版 paddlepaddle。"
+                f"OCR_DEVICE={config.device} but no Paddle CUDA GPU available in current environment. "
+                "Windows target machine must have paddlepaddle-gpu installed"
             )
 
     return {"device": config.device}

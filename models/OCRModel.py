@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 
 from typing import Any, Dict, List, Optional
 
@@ -14,4 +14,4 @@ class OCRModel(BaseModel):
 
 
 class Base64PostModel(BaseModel):
-    base64_str: str  # base64字符串
+    base64_str: str  # Base64 string

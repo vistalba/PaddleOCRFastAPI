@@ -18,7 +18,7 @@ ENV PYTHONUNBUFFERED=1 \
 
 COPY pyproject.toml uv.lock README.md /app/
 
-RUN sed -i "s@http://deb.debian.org@http://mirrors.tuna.tsinghua.edu.cn@g" /etc/apt/sources.list && \
+RUN sed -i "s@http://mirrors.tuna.tsinghua.edu.cn@http://deb.debian.org@g" /etc/apt/sources.list && \
     apt-get update && \
     apt-get install -y --no-install-recommends \
         libgl1 \
@@ -33,11 +33,11 @@ RUN sed -i "s@http://deb.debian.org@http://mirrors.tuna.tsinghua.edu.cn@g" /etc/
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-RUN python3 -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple --no-cache-dir --upgrade pip uv && \
+RUN python3 -m pip install --no-cache-dir --upgrade pip uv && \
     if [ "${INSTALL_AI}" = "true" ]; then \
-        uv sync --frozen --no-dev --no-install-project --extra ai; \
+        uv sync --no-dev --extra ai; \
     else \
-        uv sync --frozen --no-dev --no-install-project; \
+        uv sync --no-dev; \
     fi
 
 COPY . /app

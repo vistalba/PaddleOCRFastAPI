@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """Download the selected PP-OCRv6 models into the project-local PaddleX cache."""
 
 from __future__ import annotations
@@ -14,12 +14,12 @@ from utils.ocr_runtime import (
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="下载当前 OCR_MODEL_TIER 对应的离线模型"
+        description="Download offline models for current OCR_MODEL_TIER"
     )
     parser.add_argument(
         "--with-doc-preprocessor",
         action="store_true",
-        help="同时准备文档方向分类与图像矫正模型",
+        help="Prepare document orientation classification and image correction models",
     )
     args = parser.parse_args()
 
@@ -28,8 +28,8 @@ def main() -> None:
     from paddleocr import DocPreprocessor, PaddleOCR
 
     print(
-        f"准备 PP-OCRv6_{config.model_tier} 模型，"
-        f"缓存目录: {config.model_root}"
+        f"Preparing PP-OCRv6_{config.model_tier} models,"
+        f"cache directory: {config.model_root}"
     )
     ocr = PaddleOCR(
         use_doc_orientation_classify=False,
@@ -54,7 +54,7 @@ def main() -> None:
         preprocessor.close()
         validate_doc_preprocessor_models(config)
 
-    print("模型准备完成，可将项目目录复制到离线目标机。")
+    print("Models prepared successfully; project directory can be copied to offline target machine.")
 
 
 if __name__ == "__main__":

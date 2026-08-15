@@ -7,6 +7,7 @@ from sqlalchemy import (
     Column,
     DateTime,
     ForeignKey,
+    Float,
     Integer,
     String,
     Text,
@@ -28,7 +29,8 @@ class Task(Base):
     original_filename = Column(String(255), nullable=True)
     file_dir = Column(String(512), nullable=True)
     use_doc_preprocessor = Column(Boolean, nullable=False, default=False)
-    ocr_result = Column(Text, nullable=True)   # JSON 字符串
+    force_ocr = Column(Boolean, nullable=False, default=False)
+    ocr_result = Column(Text, nullable=True)   # JSON string
     error_msg = Column(Text, nullable=True)
 
     pages = relationship(
@@ -63,6 +65,10 @@ class TaskPage(Base):
     original_image_path = Column(String(512), nullable=True)
     corrected_image_path = Column(String(512), nullable=True)
     native_text = Column(large_text_type, nullable=True)
+    # PDF metadata for coordinate transformation
+    pdf_width_pts = Column(Float, nullable=True)  # PDF width in points (72 DPI)
+    pdf_height_pts = Column(Float, nullable=True)  # PDF height in points
+    render_scale = Column(Float, nullable=True)  # Scale factor used for rendering
     ocr_result = Column(large_text_type, nullable=True)
     rule_result = Column(large_text_type, nullable=True)
     ai_result = Column(large_text_type, nullable=True)

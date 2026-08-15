@@ -1,0 +1,420 @@
+# -*- coding: utf-8 -*-
+
+import os
+import io
+import httpx
+from datetime import datetime, timezone
+from typing import Any
+from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse, Response
+from reportlab.pdfgen import canvas
+from reportlab.lib.colors import Color
+from pypdf import PdfReader, PdfWriter
+from config import FORCE_OCR_FOR_AZURE
+
+router = APIRouter()
+
+LOCAL_API_PORT = os.getenv("PORT", "8000")
+PADDLE_BASE_URL = f"http://127.0.0.1:{LOCAL_API_PORT}"
+
+TASK_STORAGE: dict[str, dict[str, Any]] = {}
+
+
+def _has_text_layer(orig_page) -> bool:
+    """
+    Check if a PDF page has any text content.
+    
+    Args:
+        orig_page: pypdf PageObject to check
+    
+    Returns:
+        True if page contains text operators, False otherwise
+    """
+    contents = orig_page.get_contents()
+    if contents is None:
+        return False
+    
+    # Check parsed operations instead of raw bytes
+    operations = contents.operations
+    if not operations:
+        return False
+    
+    # Look for text operators in the operations list
+    text_operators = {b'BT', b'ET', b'Tj', b'TJ', b'T*', b'Td', b'TD', b'Tm', b'Tf'}
+    for _, operator in operations:
+        if operator in text_operators:
+            return True
+    
+    return False
+
+
+def _remove_text_layer_from_page(orig_page) -> None:
+    """
+    Remove all text content from a PDF page while preserving images and graphics.
+    
+    This function modifies the page in-place by filtering out text operators
+    from the content stream. The page retains all resources (images, fonts, etc.)
+    but will have no text content.
+    
+    Uses pypdf's proper content stream parsing instead of regex to avoid
+    corrupting the PDF structure.
+    
+    Args:
+        orig_page: pypdf PageObject to modify
+    
+    Returns:
+        None (modifies page in-place)
+    """
+    from pypdf.generic import ContentStream, NameObject, ArrayObject
+    
+    contents = orig_page.get_contents()
+    if contents is None:
+        return
+    
+    # Get parsed operations (properly parsed PDF content stream)
+    operations = contents.operations
+    if not operations:
+        return
+    
+    # Filter out text operators while preserving graphics operators
+    text_operators = {b'BT', b'ET', b'Tj', b'TJ', b'T*', b'Td', b'TD', b'Tm', b'Tf'}
+    filtered_operations = [
+        (operand, operator) 
+        for operand, operator in operations 
+        if operator not in text_operators
+    ]
+    
+    # Create new content stream with filtered operations
+    if filtered_operations:
+        new_content = ContentStream(None, None)
+        new_content.operations = filtered_operations
+        orig_page[NameObject("/Contents")] = new_content
+    else:
+        # If all operations were text, clear the content stream
+        orig_page[NameObject("/Contents")] = ArrayObject([])
+
+
+def create_searchable_pdf_layer(
+    paddle_page_data: dict, 
+    original_pdf_bytes: bytes, 
+    page_index: int,
+    force_ocr: bool = False
+) -> bytes:
+    """
+    Translates PaddleOCR text line bounding boxes to PDF coordinate system
+    and creates invisible text layer overlay.
+    
+    NOTE: Boxes are now in PDF point coordinates (72 DPI), not image pixels.
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    logger.info(f"=== PAGE {page_index} DEBUG ===")
+    logger.info(f"Page {page_index}: Starting create_searchable_pdf_layer")
+    
+    try:
+        input_pdf = PdfReader(io.BytesIO(original_pdf_bytes))
+        logger.info(f"Page {page_index}: Loaded original PDF with {len(input_pdf.pages)} pages")
+        
+        if page_index >= len(input_pdf.pages):
+            logger.warning(f"Page {page_index}: Index out of range, returning original PDF")
+            return original_pdf_bytes
+
+        orig_page = input_pdf.pages[page_index]
+        pdf_width = float(orig_page.mediabox.width)
+        pdf_height = float(orig_page.mediabox.height)
+        logger.info(f"Page {page_index}: PDF dimensions: {pdf_width:.2f} x {pdf_height:.2f} points")
+
+        packet = io.BytesIO()
+        can = canvas.Canvas(packet, pagesize=(pdf_width, pdf_height))
+        can.setFillColor(Color(0, 0, 0, alpha=0))
+        logger.info(f"Page {page_index}: Created canvas for text layer")
+        
+        skipped_count = 0
+        drawn_count = 0
+
+        cells = paddle_page_data.get("cells", [])
+        if not cells and "lines" in paddle_page_data:
+            cells = paddle_page_data.get("lines", [])
+        
+        logger.info(f"Page {page_index}: Data source: cells={len(cells)}, has_lines={'lines' in paddle_page_data}, has_ocr_result={'ocr_result' in paddle_page_data}")
+        
+        # Also try to extract from ocr_result if no cells/lines available
+        if not cells:
+            ocr_result = paddle_page_data.get("ocr_result", [])
+            render_scale = paddle_page_data.get("render_scale", 1.0)
+            logger.info(f"Page {page_index}: Using ocr_result: render_scale={render_scale}, ocr_result_len={len(ocr_result) if isinstance(ocr_result, list) else 0}")
+            if isinstance(ocr_result, list) and render_scale > 1.0:
+                # Transform boxes to PDF coordinates
+                for item in ocr_result:
+                    if isinstance(item, dict):
+                        texts = item.get("rec_texts", [])
+                        boxes = item.get("rec_boxes", [])
+                        if isinstance(texts, list) and isinstance(boxes, list):
+                            for i, text in enumerate(texts):
+                                if text and i < len(boxes):
+                                    # Transform from image pixels to PDF points
+                                    transformed_box = [coord / render_scale for coord in boxes[i]]
+                                    cells.append({
+                                        "text": text if isinstance(text, str) else str(text),
+                                        "box": transformed_box
+                                    })
+                logger.info(f"Page {page_index}: Created {len(cells)} cells from ocr_result")
+        
+        logger.info(f"Page {page_index}: Processing {len(cells)} text cells")
+        drawn_count = 0
+        skipped_count = 0
+
+        for cell in cells:
+            if isinstance(cell, str):
+                skipped_count += 1
+                continue
+
+            box = cell.get("box", [])
+            text = cell.get("text") or cell.get("content") or ""
+
+            if text and len(box) >= 4:
+                # Box format: [left, top, right, bottom]
+                # These coordinates are in PDF points, but y-axis is still image-based
+                # (origin at top-left, y increases downward)
+                try:
+                    left = float(box[0])
+                    top = float(box[1])      # Top edge (smaller y in image coords)
+                    right = float(box[2])
+                    bottom = float(box[3])   # Bottom edge (larger y in image coords)
+                except (ValueError, TypeError) as e:
+                    logger.warning(f"Page {page_index}: Invalid box format for text '{text[:30]}': {e}")
+                    skipped_count += 1
+                    continue
+
+                # Validate coordinates
+                if right < left or bottom < top:
+                    logger.warning(f"Page {page_index}: Invalid coordinates for text '{text[:30]}': left={left}, top={top}, right={right}, bottom={bottom}")
+                    skipped_count += 1
+                    continue
+
+                # Convert to PDF coordinates (origin at bottom-left, y increases upward)
+                # PDF y = pdf_height - image_y
+                pdf_x = left
+                pdf_y = pdf_height - bottom
+                font_size = max(8, bottom - top)
+
+                # Debug: Log first 3 lines of each page
+                cell_index = cells.index(cell)
+                if cell_index < 3:
+                    logger.info(f"Page {page_index} line {cell_index+1}: text='{text[:40]}', box=[{left:.2f}, {top:.2f}, {right:.2f}, {bottom:.2f}], pdf_pos=({pdf_x:.2f}, {pdf_y:.2f}), font_size={font_size:.1f}")
+
+                try:
+                    can.setFont("Helvetica", font_size)
+                    can.drawString(pdf_x, pdf_y, text)
+                    drawn_count += 1
+                    if cell_index < 3:
+                        logger.info(f"Page {page_index} line {cell_index+1}: Successfully drew text at ({pdf_x:.2f}, {pdf_y:.2f})")
+                except Exception as e:
+                    logger.error(f"Page {page_index}: drawString failed for '{text[:50]}': {e}")
+                    skipped_count += 1
+            else:
+                skipped_count += 1
+        
+        logger.info(f"Page {page_index}: Processing complete - drew {drawn_count} cells, skipped {skipped_count}")
+
+        can.save()
+        packet.seek(0)
+        logger.info(f"Page {page_index}: Saved canvas to packet")
+
+        mask_pdf = PdfReader(packet)
+        logger.info(f"Page {page_index}: Loaded mask PDF with {len(mask_pdf.pages)} pages")
+        
+        # Remove existing text layer if FORCE_OCR is enabled
+        if force_ocr:
+            logger.info(f"Page {page_index}: FORCE_OCR enabled, checking for existing text layer")
+            if _has_text_layer(orig_page):
+                logger.info(f"Page {page_index}: Existing text layer detected, removing it")
+                _remove_text_layer_from_page(orig_page)
+                logger.info(f"Page {page_index}: Existing text layer removed")
+            else:
+                logger.info(f"Page {page_index}: No existing text layer found")
+        
+        orig_page.merge_page(mask_pdf.pages[0])
+        logger.info(f"Page {page_index}: Merged text layer with original page")
+
+        output_writer = PdfWriter()
+        output_writer.add_page(orig_page)
+        logger.info(f"Page {page_index}: Added page to output writer")
+
+        output_stream = io.BytesIO()
+        output_writer.write(output_stream)
+        logger.info(f"Page {page_index}: Successfully created searchable PDF layer")
+        return output_stream.getvalue()
+
+    except Exception as e:
+        logger.error(f"Page {page_index}: Exception in create_searchable_pdf_layer: {e}", exc_info=True)
+        return original_pdf_bytes
+
+
+@router.post("/documentintelligence/documentModels/prebuilt-layout:analyze")
+async def azure_submit_document(request: Request, api_version: str = "2024-11-30"):
+    """
+    Azure Document Intelligence compatible endpoint for PDF analysis.
+    Accepts PDF via multipart form, schedules OCR task, returns 202 with Operation-Location.
+    """
+    try:
+        form = await request.form()
+        file = form.get("file")
+
+        if not file or not hasattr(file, "read"):
+            return JSONResponse(
+                status_code=400, content={"error": "Missing PDF file"}
+            )
+
+        file_bytes = await file.read()
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            files = {"file": ("document.pdf", file_bytes, "application/pdf")}
+            data = {"force_ocr": "true"} if FORCE_OCR_FOR_AZURE else {}
+            response = await client.post(
+                f"{PADDLE_BASE_URL}/ocr/tasks", files=files, data=data
+            )
+
+            if response.status_code not in [200, 202]:
+                return JSONResponse(
+                    status_code=500,
+                    content={"error": "PaddleOCR task scheduling failed"},
+                )
+
+            task_data = response.json()
+            task_id = task_data.get("task_id")
+
+        TASK_STORAGE[task_id] = {
+            "raw_pdf": file_bytes,
+            "azure_json": None,
+            "pdf_archive": None,
+            "created_at": datetime.now(timezone.utc),
+            "force_ocr": FORCE_OCR_FOR_AZURE,
+        }
+
+        host_url = str(request.base_url).rstrip("/")
+        operation_location = f"{host_url}/documentintelligence/operations/{task_id}?api-version={api_version}"
+
+        return Response(
+            status_code=202, headers={"Operation-Location": operation_location}
+        )
+
+    except Exception as e:
+        return JSONResponse(
+            status_code=500, content={"error": f"Internal server error: {str(e)}"}
+        )
+
+
+@router.get("/documentintelligence/operations/{task_id}")
+async def azure_get_status(task_id: str, api_version: str = "2024-11-30"):
+    """
+    Polling endpoint for Azure Document Intelligence operation status.
+    Returns running/succeeded/failed status with full result when complete.
+    """
+    if task_id not in TASK_STORAGE:
+        return JSONResponse(status_code=404, content={"error": "Operation not found"})
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(
+                f"{PADDLE_BASE_URL}/ocr/tasks/{task_id}"
+            )
+            if response.status_code != 200:
+                return JSONResponse(
+                    status_code=404, content={"error": "Task not found"}
+                )
+
+            paddle_data = response.json()
+
+        current_status = paddle_data.get("status", "").lower()
+
+        if current_status in ["queued", "processing"]:
+            return {"status": "running"}
+
+        if current_status in ["failed"]:
+            return {"status": "failed"}
+
+        if not TASK_STORAGE[task_id]["azure_json"]:
+            full_text_blocks = []
+            azure_pages = []
+
+            original_pdf = TASK_STORAGE[task_id]["raw_pdf"]
+            final_pdf_writer = PdfWriter()
+            
+            # Get force_ocr flag from task storage
+            force_ocr = bool(TASK_STORAGE[task_id].get("force_ocr", False))
+
+            pages = paddle_data.get("pages", [])
+            for idx, page in enumerate(pages):
+                page_num = idx + 1
+
+                lines = page.get("lines", [])
+                page_text_lines = [
+                    l if isinstance(l, str) else l.get("text") or l.get("content") or ""
+                    for l in lines
+                ]
+                page_text_lines = [text for text in page_text_lines if text]
+
+                page_full_text = "\n".join(page_text_lines)
+                full_text_blocks.append(page_full_text)
+
+                page_merged_bytes = create_searchable_pdf_layer(
+                    page, original_pdf, idx, force_ocr=force_ocr
+                )
+                page_reader = PdfReader(io.BytesIO(page_merged_bytes))
+                final_pdf_writer.add_page(page_reader.pages[0])
+
+                azure_pages.append(
+                    {
+                        "pageNumber": page_num,
+                        "angle": 0,
+                        # Read actual PDF page dimensions from the original PDF
+                        "width": page_reader.pages[0].mediabox.width / 72.0,
+                        "height": page_reader.pages[0].mediabox.height / 72.0,
+                        "unit": "inch",
+                        "lines": [{"content": l} for l in page_text_lines],
+                    }
+                )
+
+            pdf_output_stream = io.BytesIO()
+            final_pdf_writer.write(pdf_output_stream)
+
+            TASK_STORAGE[task_id]["pdf_archive"] = pdf_output_stream.getvalue()
+            TASK_STORAGE[task_id]["azure_json"] = {
+                "status": "succeeded",
+                "createdDateTime": TASK_STORAGE[task_id][
+                    "created_at"
+                ].isoformat(),
+                "lastUpdatedDateTime": datetime.now(timezone.utc).isoformat(),
+                "analyzeResult": {
+                    "apiVersion": api_version,
+                    "modelId": "prebuilt-layout",
+                    "content": "\n\n".join(full_text_blocks),
+                    "pages": azure_pages,
+                },
+            }
+
+        return TASK_STORAGE[task_id]["azure_json"]
+
+    except Exception as e:
+        return JSONResponse(
+            status_code=500, content={"error": f"Internal server error: {str(e)}"}
+        )
+
+
+@router.get("/documentintelligence/operations/{task_id}/pdf")
+async def azure_download_pdf(task_id: str):
+    """
+    Download searchable PDF with embedded text layer.
+    """
+    if task_id in TASK_STORAGE and TASK_STORAGE[task_id]["pdf_archive"]:
+        return Response(
+            content=TASK_STORAGE[task_id]["pdf_archive"],
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f"attachment; filename=archive_{task_id}.pdf"
+            },
+        )
+
+    return JSONResponse(status_code=404, content={"error": "PDF not ready"})

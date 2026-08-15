@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 
 import asyncio
 import ipaddress
@@ -56,15 +56,15 @@ from utils.text_organizer import (
 
 logger = logging.getLogger(__name__)
 
-# OCR 模型与 PDF 渲染均在进程池中执行，避免阻塞 FastAPI 事件循环。
+# OCR models and PDF rendering run in the process pool to avoid blocking the FastAPI event loop.
 _ocr_pool = ProcessPoolExecutor(max_workers=MAX_CONCURRENT_OCR)
 _ocr_pool_lock = asyncio.Lock()
 
-# llama.cpp 自身管理 CPU 线程；单独的单 worker 线程池保证模型只加载一份。
+# llama.cpp manages CPU threads itself; a separate single-worker thread pool ensures the model is loaded only once.
 _ai_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="text-ai")
 _ai_page_locks: dict[tuple[str, int], asyncio.Lock] = {}
 
-# 一个队列任务对应一个有序输入集合：单图/PDF 为 1 个路径，多图为 N 个路径。
+# One queue task corresponds to an ordered set of inputs: single image/PDF = 1 path, multiple images = N paths.
 _task_queue: asyncio.Queue[tuple[str, tuple[Path, ...]]] = asyncio.Queue()
 _worker_tasks: list[asyncio.Task] = []
 
@@ -107,6 +107,7 @@ class TaskPageResponse(BaseModel):
     ocr_image_variant: str = "original"
     native_text: Optional[str] = None
     ocr_result: Optional[Any] = None
+    lines: List[dict] = Field(default_factory=list)
     rule_result: Optional[Any] = None
     ai_result: Optional[Any] = None
     ai_status: str = "not_started"
@@ -114,6 +115,9 @@ class TaskPageResponse(BaseModel):
     ai_processed_at: Optional[datetime] = None
     ai_error: Optional[str] = None
     error_msg: Optional[str] = None
+    pdf_width_pts: Optional[float] = None
+    pdf_height_pts: Optional[float] = None
+    render_scale: Optional[float] = None
 
 
 class TaskDetailResponse(BaseModel):
@@ -129,7 +133,7 @@ class TaskDetailResponse(BaseModel):
     failed_pages: int = 0
     pages: List[TaskPageResponse] = Field(default_factory=list)
 
-    # 第一页兼容字段，供旧前端或旧 API 调用方继续使用。
+    # First page compatibility field for old frontends or old API callers.
     image_variants: TaskImageVariants
     default_image_variant: str = "original"
     ocr_image_variant: str = "original"
@@ -279,11 +283,11 @@ def _read_retry_available_at(task: Task) -> Optional[datetime]:
                 return datetime.fromisoformat(value)
         except (OSError, ValueError, json.JSONDecodeError):
             logger.warning(
-                "无法读取任务重试状态，task_id=%s",
+                "Unable to read task retry status, task_id=%s",
                 task.task_id,
             )
 
-    # 兼容升级前已经失败的任务：从 manifest 修改时间推算冷却期。
+    # Compatibility for tasks failed before upgrade: infer cooldown from manifest mtime.
     if task.file_dir:
         manifest_path = Path(task.file_dir) / "manifest.json"
         if manifest_path.is_file():
@@ -327,11 +331,11 @@ def _remove_task_files(file_dir: Optional[str]) -> None:
     try:
         task_dir.relative_to(upload_root)
     except ValueError:
-        logger.error("拒绝删除上传目录之外的任务文件：%s", task_dir)
+        logger.error("Refusing to delete task files outside upload directory: %s", task_dir)
         return
 
     if task_dir == upload_root:
-        logger.error("拒绝删除上传根目录：%s", task_dir)
+        logger.error("Refusing to delete upload root directory: %s", task_dir)
         return
 
     if task_dir.is_dir():
@@ -384,6 +388,80 @@ def _resolve_result_image_variant(
     return "original"
 
 
+def _extract_lines_from_ocr_result(
+    ocr_result: Optional[Any], 
+    render_scale: float = 1.0
+) -> list[dict]:
+    """Extract text lines with bounding boxes from PaddleOCR ocr_result.
+    
+    If render_scale > 1.0, boxes are transformed from image pixels to PDF points.
+    """
+    if render_scale > 1.0:
+        # Transform boxes from image pixels to PDF points
+        return _transform_boxes_to_pdf_coordinates(ocr_result, render_scale)
+    
+    # Return boxes as-is (already in correct coordinates)
+    lines = []
+    if not isinstance(ocr_result, list):
+        return lines
+    
+    for item in ocr_result:
+        if not isinstance(item, dict):
+            continue
+        
+        texts = item.get("rec_texts", [])
+        boxes = item.get("rec_boxes", [])
+        
+        if isinstance(texts, list) and isinstance(boxes, list):
+            for i, text in enumerate(texts):
+                box = boxes[i] if i < len(boxes) else []
+                if text and isinstance(text, str):
+                    lines.append({
+                        "text": text.strip(),
+                        "box": box if isinstance(box, list) else []
+                    })
+    
+    return lines
+
+
+def _transform_boxes_to_pdf_coordinates(
+    ocr_result: Optional[Any],
+    render_scale: float
+) -> list[dict]:
+    """Transform bounding boxes from image pixels to PDF points.
+    
+    Args:
+        ocr_result: PaddleOCR result with boxes in image pixel coordinates
+        render_scale: Scale factor used when rendering PDF to image
+    
+    Returns:
+        Lines with boxes in PDF point coordinates
+    """
+    lines = []
+    if not isinstance(ocr_result, list) or render_scale <= 0:
+        return lines
+    
+    for item in ocr_result:
+        if not isinstance(item, dict):
+            continue
+        
+        texts = item.get("rec_texts", [])
+        boxes = item.get("rec_boxes", [])
+        
+        if isinstance(texts, list) and isinstance(boxes, list):
+            for i, text in enumerate(texts):
+                box = boxes[i] if i < len(boxes) else []
+                if text and isinstance(text, str) and box:
+                    # Transform from image pixels to PDF points
+                    transformed_box = [coord / render_scale for coord in box]
+                    lines.append({
+                        "text": text.strip(),
+                        "box": transformed_box
+                    })
+    
+    return lines
+
+
 def _build_page_image_variants(
     task_id: str,
     page_index: int,
@@ -428,6 +506,7 @@ def _build_page_response(
     include_result: bool,
 ) -> TaskPageResponse:
     ocr_result = _parse_json(page.ocr_result) if include_result else None
+    render_scale = page.render_scale if include_result and page.render_scale else 1.0
     image_files = _page_image_files(page)
     image_variants = _build_page_image_variants(
         task.task_id, page.page_index, image_files
@@ -440,6 +519,7 @@ def _build_page_response(
     default_image_variant = (
         "corrected" if image_files["corrected"] is not None else "original"
     )
+    lines = _extract_lines_from_ocr_result(ocr_result, render_scale) if include_result else []
     return TaskPageResponse(
         page_index=page.page_index,
         status=page.status,
@@ -451,6 +531,7 @@ def _build_page_response(
         ocr_image_variant=ocr_image_variant,
         native_text=page.native_text if include_result else None,
         ocr_result=ocr_result,
+        lines=lines,
         rule_result=(
             _parse_json(page.rule_result) if include_result else None
         ),
@@ -462,6 +543,9 @@ def _build_page_response(
         ai_processed_at=page.ai_processed_at,
         ai_error=page.ai_error,
         error_msg=page.error_msg,
+        pdf_width_pts=page.pdf_width_pts if include_result else None,
+        pdf_height_pts=page.pdf_height_pts if include_result else None,
+        render_scale=page.render_scale if include_result else None,
     )
 
 
@@ -584,7 +668,7 @@ async def _save_upload_file(
     file: UploadFile,
     output_path: Path,
     max_bytes: Optional[int] = None,
-    limit_label: str = "文件大小",
+    limit_label: str = "File size",
 ) -> int:
     byte_limit = (
         max_bytes
@@ -602,7 +686,7 @@ async def _save_upload_file(
                 raise HTTPException(
                     status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
                     detail=(
-                        f"{limit_label}超过 {MAX_UPLOAD_SIZE_MB} MB 限制"
+                        f"{limit_label} exceeds {MAX_UPLOAD_SIZE_MB} MB limit"
                     ),
                 )
             output.write(chunk)
@@ -610,7 +694,7 @@ async def _save_upload_file(
     if total == 0:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="上传文件为空",
+            detail="Uploaded file is empty",
         )
     return total
 
@@ -622,7 +706,7 @@ def _validate_uploaded_file(path: Path, suffix: str) -> None:
         if b"%PDF-" not in header:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="文件内容不是有效的 PDF",
+                detail="File content is not a valid PDF",
             )
         return
 
@@ -632,7 +716,7 @@ def _validate_uploaded_file(path: Path, suffix: str) -> None:
     except (UnidentifiedImageError, OSError, ValueError) as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="文件内容不是有效的图片",
+            detail="File content is not a valid image",
         ) from exc
 
 
@@ -710,11 +794,11 @@ async def _run_in_ocr_pool(function, *args):
                         cancel_futures=True,
                     )
                 except Exception:
-                    logger.exception("释放已损坏 OCR 进程池失败")
+                    logger.exception("Failed to release corrupted OCR process pool")
                 _ocr_pool = ProcessPoolExecutor(
                     max_workers=MAX_CONCURRENT_OCR
                 )
-                logger.error("OCR 子进程异常退出，已重建进程池")
+                logger.error("OCR subprocess exited abnormally; process pool has been rebuilt")
         raise
 
 
@@ -726,7 +810,7 @@ async def _ocr_queue_worker() -> None:
         try:
             await _process_ocr_async(task_id, source_paths)
         except Exception:
-            logger.exception("OCR worker 遇到未捕获异常，task_id=%s", task_id)
+            logger.exception("OCR worker encountered uncaught exception, task_id=%s", task_id)
         finally:
             _task_queue.task_done()
 
@@ -745,7 +829,7 @@ async def start_workers() -> None:
         )
         for page in stale_ai_pages:
             page.ai_status = "failed"
-            page.ai_error = "服务重启导致 AI 整理中断，请重新整理"
+            page.ai_error = "Service restart interrupted AI organization; please re-organize"
         if stale_ai_pages:
             db.commit()
 
@@ -764,7 +848,7 @@ async def start_workers() -> None:
             task.status = "queued"
             db.commit()
             await _task_queue.put((task.task_id, tuple(source_paths)))
-            logger.info("崩溃恢复：重新入队 task_id=%s", task.task_id)
+            logger.info("Crash recovery: re-queuing task_id=%s", task.task_id)
     finally:
         db.close()
 
@@ -809,6 +893,9 @@ def _upsert_task_pages(
         page.processing_method = item["processing_method"]
         page.width = item.get("width")
         page.height = item.get("height")
+        page.pdf_width_pts = item.get("pdf_width_pts")
+        page.pdf_height_pts = item.get("pdf_height_pts")
+        page.render_scale = item.get("render_scale")
         page.original_image_path = item.get("original_image_path")
         page.corrected_image_path = None
         page.native_text = item.get("native_text")
@@ -854,6 +941,7 @@ async def _process_ocr_async(
             prepared = await _run_in_ocr_pool(
                 prepare_document_file,
                 str(normalized_sources[0]),
+                bool(task.force_ocr),
             )
         else:
             prepared = await _run_in_ocr_pool(
@@ -909,7 +997,7 @@ async def _process_ocr_async(
                 page.error_msg = str(exc)
                 failed_pages += 1
                 logger.exception(
-                    "页面处理失败，task_id=%s page_index=%s",
+                    "Page processing failed, task_id=%s page_index=%s",
                     task_id,
                     page.page_index,
                 )
@@ -928,14 +1016,14 @@ async def _process_ocr_async(
         if successful_pages > 0:
             task.status = "done"
             task.error_msg = (
-                f"{failed_pages} 页处理失败"
+                f"{failed_pages} pages failed to process"
                 if failed_pages > 0
                 else None
             )
             _clear_retry_state(task)
         else:
             task.status = "failed"
-            task.error_msg = "所有页面均处理失败"
+            task.error_msg = "All pages failed to process"
             _write_retry_state(task)
         db.commit()
 
@@ -962,7 +1050,7 @@ async def _process_ocr_async(
                 .all()
             )
             _write_manifest(task, pages)
-        logger.exception("任务处理失败，task_id=%s", task_id)
+        logger.exception("Task processing failed，task_id=%s", task_id)
     finally:
         db.close()
 
@@ -973,13 +1061,14 @@ async def _process_ocr_async(
     "/tasks",
     response_model=TaskCreateResponse,
     status_code=status.HTTP_202_ACCEPTED,
-    summary="创建 OCR 任务（单文件，可包含多页）",
+    summary="Create OCR task (single file, can include multiple pages)",
 )
 @limiter.limit(RATE_LIMIT)
 async def create_task(
     request: Request,
     file: UploadFile,
     use_doc_preprocessor: bool = Form(False),
+    force_ocr: bool = Form(False),
     db: Session = Depends(get_db),
 ):
     suffix = Path(file.filename).suffix.lower() if file.filename else ""
@@ -987,7 +1076,7 @@ async def create_task(
         supported = ", ".join(sorted(ALLOWED_EXTENSIONS))
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"不支持的文件格式，请上传: {supported}",
+            detail=f"Unsupported file format, please upload: {supported}",
         )
 
     ip = get_client_ip(request)
@@ -1013,6 +1102,7 @@ async def create_task(
         original_filename=file.filename,
         file_dir=str(task_dir),
         use_doc_preprocessor=use_doc_preprocessor,
+        force_ocr=force_ocr,
     )
     db.add(task)
     db.commit()
@@ -1025,7 +1115,7 @@ async def create_task(
     "/tasks/multi-image",
     response_model=TaskCreateResponse,
     status_code=status.HTTP_202_ACCEPTED,
-    summary="创建多图片 OCR 任务（上传顺序即页面顺序）",
+    summary="Create multi-image OCR task (upload order is page order)",
 )
 @limiter.limit(RATE_LIMIT)
 async def create_multi_image_task(
@@ -1037,13 +1127,13 @@ async def create_multi_image_task(
     if not files:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="请至少上传一张图片",
+            detail="Please upload at least one image",
         )
     if len(files) > MAX_MULTI_IMAGE_PAGES:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=(
-                f"一次最多上传 {MAX_MULTI_IMAGE_PAGES} 张图片"
+                f"Upload at most {MAX_MULTI_IMAGE_PAGES} images at once"
             ),
         )
 
@@ -1061,9 +1151,9 @@ async def create_multi_image_task(
                 )
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=(
-                        "多页模式仅支持图片，不支持 PDF；"
-                        f"请上传: {supported}"
+detail=(
+                        "Multi-page mode only supports images, not PDF; "
+                        f"please upload: {supported}"
                     ),
                 )
             suffixes.append(suffix)
@@ -1088,7 +1178,7 @@ async def create_multi_image_task(
                 file,
                 source_path,
                 max_bytes=remaining_bytes,
-                limit_label="多页任务文件总大小",
+                limit_label="Multi-page task total file size",
             )
             remaining_bytes -= written
             _validate_uploaded_file(source_path, suffix)
@@ -1106,7 +1196,7 @@ async def create_multi_image_task(
     display_name = (
         original_names[0]
         if len(original_names) == 1
-        else f"{original_names[0]} 等 {len(original_names)} 张图片"
+        else f"{original_names[0]} and {len(original_names) - 1} other image(s)"
     )
     task = Task(
         task_id=task_id,
@@ -1137,14 +1227,14 @@ def _reset_failed_task_for_retry(
     if task.status != "failed":
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="只有失败任务可以重试",
+            detail="Only failed tasks can be retried",
         )
 
     _, retry_after_seconds = _retry_after_seconds(task)
     if retry_after_seconds > 0:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail=f"请在 {retry_after_seconds} 秒后重试",
+            detail=f"Please try again in {retry_after_seconds} seconds",
             headers={
                 "Retry-After": str(retry_after_seconds),
             },
@@ -1153,13 +1243,13 @@ def _reset_failed_task_for_retry(
     if not task.file_dir:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="任务原文件不存在，无法重试",
+            detail="Task original file does not exist, cannot retry",
         )
     source_paths = tuple(_task_source_files(Path(task.file_dir)))
     if not source_paths:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="任务原文件不存在，无法重试",
+            detail="Task original file does not exist, cannot retry",
         )
 
     task.status = "queued"
@@ -1193,7 +1283,7 @@ def _reset_failed_task_for_retry(
     "/tasks/{task_id}/retry",
     response_model=TaskCreateResponse,
     status_code=status.HTTP_202_ACCEPTED,
-    summary="在冷却期结束后重试失败任务",
+    summary="Retry failed task after cooldown period",
 )
 @limiter.limit(RATE_LIMIT)
 async def retry_task(
@@ -1209,7 +1299,7 @@ async def retry_task(
     if not task:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="任务不存在",
+            detail="Task does not exist",
         )
 
     source_paths = _reset_failed_task_for_retry(db, task)
@@ -1220,7 +1310,7 @@ async def retry_task(
 @router.get(
     "/tasks/{task_id}",
     response_model=TaskDetailResponse,
-    summary="查询 OCR 任务状态与逐页结果",
+    summary="Query OCR task status and page-by-page results",
 )
 def get_task(
     request: Request,
@@ -1231,7 +1321,7 @@ def get_task(
     if not task:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="任务不存在",
+            detail="Task does not exist",
         )
 
     queue_position: Optional[int] = None
@@ -1300,7 +1390,7 @@ async def _run_in_ai_pool(page: TaskPage) -> dict[str, Any]:
 @router.post(
     "/tasks/{task_id}/pages/{page_index}/organize",
     response_model=AIOrganizePageResponse,
-    summary="使用可选的本地模型整理当前页文字",
+    summary="Use optional local model to organize current page text",
 )
 @limiter.limit(RATE_LIMIT)
 async def organize_task_page(
@@ -1321,7 +1411,7 @@ async def organize_task_page(
         if not task:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail="任务不存在",
+                detail="Task does not exist",
             )
         page = (
             db.query(TaskPage)
@@ -1338,24 +1428,24 @@ async def organize_task_page(
         if page is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail="页面不存在",
+                detail="Page does not exist",
             )
         if page.status != "done":
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail="页面识别完成后才能进行 AI 整理",
+                detail="Page must be recognized before AI organization",
             )
 
         repeat_allowed = _is_loopback_ip(get_client_ip(request))
         if page.ai_result and not repeat_allowed:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail="当前页已经通过 AI 整理",
+                detail="Current page has already been organized by AI",
             )
         if page.ai_status == "processing":
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail="当前页正在进行 AI 整理",
+                detail="Current page is being organized by AI",
             )
 
         organizer = ai_organizer_status()
@@ -1371,7 +1461,7 @@ async def organize_task_page(
         ):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="当前页没有可整理的文字",
+                detail="Current page has no text to organize",
             )
 
         page.ai_status = "processing"
@@ -1396,11 +1486,11 @@ async def organize_task_page(
             _write_page_result(page)
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"AI 整理失败：{exc}",
+                detail=f"AI organization failed：{exc}",
             ) from exc
         except Exception as exc:
             logger.exception(
-                "AI 整理失败，task_id=%s page_index=%s",
+                "AI organization failed，task_id=%s page_index=%s",
                 task_id,
                 page_index,
             )
@@ -1413,12 +1503,12 @@ async def organize_task_page(
                 .one()
             )
             page.ai_status = "failed"
-            page.ai_error = "AI 整理发生内部错误"
+            page.ai_error = "AI organization encountered an internal error"
             db.commit()
             _write_page_result(page)
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="AI 整理发生内部错误",
+                detail="AI organization encountered an internal error",
             ) from exc
 
         page = (
@@ -1450,7 +1540,7 @@ async def organize_task_page(
 @router.delete(
     "/tasks/{task_id}",
     status_code=status.HTTP_204_NO_CONTENT,
-    summary="删除已结束的 OCR 任务及其保存文件",
+    summary="Delete completed OCR task and its saved files",
 )
 def delete_task(
     request: Request,
@@ -1466,12 +1556,12 @@ def delete_task(
     if not task:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="任务不存在",
+            detail="Task does not exist",
         )
     if task.status not in {"done", "failed"}:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="任务正在处理，完成后才能删除",
+            detail="Task is processing, can only delete after completion",
         )
 
     file_dir = task.file_dir
@@ -1480,7 +1570,7 @@ def delete_task(
     try:
         _remove_task_files(file_dir)
     except OSError:
-        logger.exception("清理任务文件失败，task_id=%s", task_id)
+        logger.exception("Failed to clean task files，task_id=%s", task_id)
 
 
 def _serve_image_file(image_file: Path) -> FileResponse:
@@ -1493,7 +1583,7 @@ def _serve_image_file(image_file: Path) -> FileResponse:
 
 @router.get(
     "/tasks/{task_id}/pages/{page_index}/image",
-    summary="获取任务指定页面图片",
+    summary="Get specified page image for task",
 )
 def get_task_page_image(
     task_id: str,
@@ -1504,14 +1594,14 @@ def get_task_page_image(
     if variant not in {"original", "corrected"}:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="不支持的图片变体",
+            detail="Unsupported image variant",
         )
 
     task: Task = db.query(Task).filter(Task.task_id == task_id).first()
     if not task:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="任务不存在",
+            detail="Task does not exist",
         )
 
     page = (
@@ -1532,14 +1622,14 @@ def get_task_page_image(
     if image_file is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="页面图片不存在",
+            detail="Page image does not exist",
         )
     return _serve_image_file(image_file)
 
 
 @router.get(
     "/tasks/{task_id}/image",
-    summary="获取任务第一页面图片（兼容接口）",
+    summary="Get task first page image (compatibility interface)",
 )
 def get_task_image(
     task_id: str,
@@ -1549,14 +1639,14 @@ def get_task_image(
     if variant not in {"original", "corrected"}:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="不支持的图片变体",
+            detail="Unsupported image variant",
         )
 
     task: Task = db.query(Task).filter(Task.task_id == task_id).first()
     if not task or not task.file_dir:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="任务不存在",
+            detail="Task does not exist",
         )
 
     first_page = (
@@ -1573,7 +1663,7 @@ def get_task_image(
     if image_file is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="图片不存在",
+            detail="Image does not exist",
         )
     return _serve_image_file(image_file)
 
@@ -1581,7 +1671,7 @@ def get_task_image(
 @router.get(
     "/tasks",
     response_model=TaskListResponse,
-    summary="查询当前 IP 的历史任务列表",
+    summary="Query historical task list for current IP",
 )
 def list_tasks(
     request: Request,

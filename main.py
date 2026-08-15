@@ -15,20 +15,21 @@ from models import TaskModel  # noqa: F401 – ensure table is registered before
 from routers import ocr
 from routers import tasks
 from routers.tasks import _ai_pool, _ocr_pool, start_workers, stop_workers
+from azure_api import router as azure_compatibility_router
 from schema_migrations import ensure_task_page_organization_columns
 from utils.ImageHelper import *
 
-# 启动时建表（若不存在）
+# Create tables at startup (if they don't exist)
 Base.metadata.create_all(bind=engine)
 ensure_task_page_organization_columns(engine)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 启动 OCR 任务队列 worker（含崩溃恢复）
+    # Start OCR task queue workers (with crash recovery)
     await start_workers()
     yield
-    # 关闭 worker 协程，再关闭进程池
+    # Close worker coroutines, then shutdown process pool
     await stop_workers()
     _ocr_pool.shutdown(wait=False)
     _ai_pool.shutdown(wait=False, cancel_futures=True)
@@ -36,11 +37,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Paddle OCR API",
-    description="基于 Paddle OCR 和 FastAPI 的自用接口",
+    description="Personal OCR API based on PaddleOCR and FastAPI",
     lifespan=lifespan,
 )
 
-# slowapi 限流
+# slowapi rate limiting
 app.state.limiter = limiter
 
 
@@ -48,11 +49,11 @@ app.state.limiter = limiter
 async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
     return JSONResponse(
         status_code=429,
-        content={"resultcode": 429, "message": "请求过于频繁，请稍后再试", "data": []},
+        content={"resultcode": 429, "message": "Too many requests, please try again later", "data": []},
     )
 
 
-# 跨域设置
+# CORS configuration
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -63,5 +64,6 @@ app.add_middleware(
 
 app.include_router(ocr.router)
 app.include_router(tasks.router)
+app.include_router(azure_compatibility_router)
 
 # uvicorn.run(app=app, host="0.0.0.0", port=48301)
