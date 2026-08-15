@@ -221,7 +221,7 @@ class DocumentProcessorTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(
                     DocumentPreparationError,
-                    "超过最大限制 1 张",
+                    "exceeding maximum limit of 1",
                 ):
                     prepare_document_files([str(first), str(second)])
 
@@ -234,7 +234,7 @@ class DocumentProcessorTests(unittest.TestCase):
             with patch("utils.document_processor.MAX_PDF_PAGES", 1):
                 with self.assertRaisesRegex(
                     DocumentPreparationError,
-                    "超过最大限制 1 页",
+                    "exceeding maximum limit of 1 pages",
                 ):
                     prepare_document_file(str(text_pdf))
 
@@ -242,7 +242,7 @@ class DocumentProcessorTests(unittest.TestCase):
             malformed_pdf.write_bytes(b"%PDF-1.4\nnot a complete PDF")
             with self.assertRaisesRegex(
                 DocumentPreparationError,
-                "无法打开 PDF",
+                "Unable to open PDF",
             ):
                 prepare_document_file(str(malformed_pdf))
 

@@ -153,7 +153,7 @@ class TaskPipelineTests(unittest.TestCase):
             }
         ]
 
-        def fake_prepare(_source_path):
+        def fake_prepare(_source_path, _force_ocr=False):
             return prepared
 
         def fake_ocr(_image_path, _use_doc_preprocessor):
@@ -255,7 +255,7 @@ class TaskPipelineTests(unittest.TestCase):
                 patch.object(
                     tasks,
                     "prepare_document_file",
-                    lambda _source_path: prepared,
+                    lambda _source_path, _force_ocr=False: prepared,
                 ),
             ):
                 asyncio.run(
