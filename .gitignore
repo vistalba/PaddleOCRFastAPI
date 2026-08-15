@@ -1,4 +1,6 @@
 __pycache__/
+.venv/
+.pytest_cache/
 test.py
 .paddlex/
 .python-version
