@@ -117,7 +117,7 @@ def _validate_model_dir(model_name: str, model_dir: Path) -> None:
     ]
     if missing:
         missing_text = ", ".join(missing)
-raise FileNotFoundError(
+        raise FileNotFoundError(
             f"Offline model {model_name} is incomplete: {model_dir} missing {missing_text}. "
             "Please run `uv run python -m scripts.prepare_models` in a connected environment, "
             "then copy the project directory to the target machine."
@@ -158,8 +158,8 @@ def _device_kwargs(config: OCRRuntimeConfig) -> dict[str, Any]:
             or paddle.device.cuda.device_count() == 0
         ):
             raise RuntimeError(
-                f"OCR_DEVICE={device} but no Paddle CUDA GPU available in current environment。"
-                "Windows target machine must have paddlepaddle-gpu installed
+                f"OCR_DEVICE={config.device} but no Paddle CUDA GPU available in current environment. "
+                "Windows target machine must have paddlepaddle-gpu installed"
             )
 
     return {"device": config.device}

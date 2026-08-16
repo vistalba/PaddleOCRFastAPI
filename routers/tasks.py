@@ -107,6 +107,7 @@ class TaskPageResponse(BaseModel):
     ocr_image_variant: str = "original"
     native_text: Optional[str] = None
     ocr_result: Optional[Any] = None
+    lines: List[dict] = Field(default_factory=list)
     rule_result: Optional[Any] = None
     ai_result: Optional[Any] = None
     ai_status: str = "not_started"
@@ -114,6 +115,9 @@ class TaskPageResponse(BaseModel):
     ai_processed_at: Optional[datetime] = None
     ai_error: Optional[str] = None
     error_msg: Optional[str] = None
+    pdf_width_pts: Optional[float] = None
+    pdf_height_pts: Optional[float] = None
+    render_scale: Optional[float] = None
 
 
 class TaskDetailResponse(BaseModel):
@@ -384,6 +388,80 @@ def _resolve_result_image_variant(
     return "original"
 
 
+def _extract_lines_from_ocr_result(
+    ocr_result: Optional[Any], 
+    render_scale: float = 1.0
+) -> list[dict]:
+    """Extract text lines with bounding boxes from PaddleOCR ocr_result.
+    
+    If render_scale > 1.0, boxes are transformed from image pixels to PDF points.
+    """
+    if render_scale > 1.0:
+        # Transform boxes from image pixels to PDF points
+        return _transform_boxes_to_pdf_coordinates(ocr_result, render_scale)
+    
+    # Return boxes as-is (already in correct coordinates)
+    lines = []
+    if not isinstance(ocr_result, list):
+        return lines
+    
+    for item in ocr_result:
+        if not isinstance(item, dict):
+            continue
+        
+        texts = item.get("rec_texts", [])
+        boxes = item.get("rec_boxes", [])
+        
+        if isinstance(texts, list) and isinstance(boxes, list):
+            for i, text in enumerate(texts):
+                box = boxes[i] if i < len(boxes) else []
+                if text and isinstance(text, str):
+                    lines.append({
+                        "text": text.strip(),
+                        "box": box if isinstance(box, list) else []
+                    })
+    
+    return lines
+
+
+def _transform_boxes_to_pdf_coordinates(
+    ocr_result: Optional[Any],
+    render_scale: float
+) -> list[dict]:
+    """Transform bounding boxes from image pixels to PDF points.
+    
+    Args:
+        ocr_result: PaddleOCR result with boxes in image pixel coordinates
+        render_scale: Scale factor used when rendering PDF to image
+    
+    Returns:
+        Lines with boxes in PDF point coordinates
+    """
+    lines = []
+    if not isinstance(ocr_result, list) or render_scale <= 0:
+        return lines
+    
+    for item in ocr_result:
+        if not isinstance(item, dict):
+            continue
+        
+        texts = item.get("rec_texts", [])
+        boxes = item.get("rec_boxes", [])
+        
+        if isinstance(texts, list) and isinstance(boxes, list):
+            for i, text in enumerate(texts):
+                box = boxes[i] if i < len(boxes) else []
+                if text and isinstance(text, str) and box:
+                    # Transform from image pixels to PDF points
+                    transformed_box = [coord / render_scale for coord in box]
+                    lines.append({
+                        "text": text.strip(),
+                        "box": transformed_box
+                    })
+    
+    return lines
+
+
 def _build_page_image_variants(
     task_id: str,
     page_index: int,
@@ -428,6 +506,7 @@ def _build_page_response(
     include_result: bool,
 ) -> TaskPageResponse:
     ocr_result = _parse_json(page.ocr_result) if include_result else None
+    render_scale = page.render_scale if include_result and page.render_scale else 1.0
     image_files = _page_image_files(page)
     image_variants = _build_page_image_variants(
         task.task_id, page.page_index, image_files
@@ -440,6 +519,7 @@ def _build_page_response(
     default_image_variant = (
         "corrected" if image_files["corrected"] is not None else "original"
     )
+    lines = _extract_lines_from_ocr_result(ocr_result, render_scale) if include_result else []
     return TaskPageResponse(
         page_index=page.page_index,
         status=page.status,
@@ -451,6 +531,7 @@ def _build_page_response(
         ocr_image_variant=ocr_image_variant,
         native_text=page.native_text if include_result else None,
         ocr_result=ocr_result,
+        lines=lines,
         rule_result=(
             _parse_json(page.rule_result) if include_result else None
         ),
@@ -462,6 +543,9 @@ def _build_page_response(
         ai_processed_at=page.ai_processed_at,
         ai_error=page.ai_error,
         error_msg=page.error_msg,
+        pdf_width_pts=page.pdf_width_pts if include_result else None,
+        pdf_height_pts=page.pdf_height_pts if include_result else None,
+        render_scale=page.render_scale if include_result else None,
     )
 
 
@@ -809,6 +893,9 @@ def _upsert_task_pages(
         page.processing_method = item["processing_method"]
         page.width = item.get("width")
         page.height = item.get("height")
+        page.pdf_width_pts = item.get("pdf_width_pts")
+        page.pdf_height_pts = item.get("pdf_height_pts")
+        page.render_scale = item.get("render_scale")
         page.original_image_path = item.get("original_image_path")
         page.corrected_image_path = None
         page.native_text = item.get("native_text")
@@ -854,6 +941,7 @@ async def _process_ocr_async(
             prepared = await _run_in_ocr_pool(
                 prepare_document_file,
                 str(normalized_sources[0]),
+                bool(task.force_ocr),
             )
         else:
             prepared = await _run_in_ocr_pool(
@@ -980,6 +1068,7 @@ async def create_task(
     request: Request,
     file: UploadFile,
     use_doc_preprocessor: bool = Form(False),
+    force_ocr: bool = Form(False),
     db: Session = Depends(get_db),
 ):
     suffix = Path(file.filename).suffix.lower() if file.filename else ""
@@ -1013,6 +1102,7 @@ async def create_task(
         original_filename=file.filename,
         file_dir=str(task_dir),
         use_doc_preprocessor=use_doc_preprocessor,
+        force_ocr=force_ocr,
     )
     db.add(task)
     db.commit()

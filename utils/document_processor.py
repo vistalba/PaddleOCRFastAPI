@@ -17,7 +17,7 @@ from config import (
     MAX_PDF_PAGES,
     PDF_MAX_RENDER_PIXELS,
     PDF_NATIVE_TEXT_MIN_CHARS,
-    PDF_RENDER_SCALE,
+    OCR_DPI,
 )
 
 
@@ -59,35 +59,48 @@ def should_use_native_pdf_text(
     return meaningful_text_char_count(value) >= max(1, minimum_chars)
 
 
-def _safe_pdf_scale(width: float, height: float) -> float:
-    if width <= 0 or height <= 0:
-        raise DocumentPreparationError("Invalid PDF page dimensions")
-
-    requested = max(0.1, PDF_RENDER_SCALE)
-    estimated_pixels = width * height * requested * requested
+def _calculate_scale_from_dpi(pdf_width_pts: float, pdf_height_pts: float) -> float:
+    """Calculate render scale based on OCR_DPI and PDF dimensions.
+    
+    PDF native DPI is 72 points per inch.
+    Scale = OCR_DPI / 72 to achieve target DPI.
+    """
+    scale = OCR_DPI / 72.0
+    
+    # Check if this would exceed max pixels
+    estimated_pixels = pdf_width_pts * pdf_height_pts * scale * scale
     if estimated_pixels <= PDF_MAX_RENDER_PIXELS:
-        return requested
+        return scale
+    
+    # Fallback: reduce scale to fit
+    max_scale = math.sqrt(PDF_MAX_RENDER_PIXELS / (pdf_width_pts * pdf_height_pts))
+    if max_scale < 0.25:
+        raise DocumentPreparationError("PDF page too large to render at minimum quality")
+    return max_scale
 
-    scale = math.sqrt(PDF_MAX_RENDER_PIXELS / (width * height))
-    if scale < 0.25:
-        raise DocumentPreparationError("PDF page dimensions too large to render safely")
-    return scale
 
-
-def _render_pdf_page(page: Any, output_path: Path) -> tuple[int, int]:
-    width, height = page.get_size()
-    scale = _safe_pdf_scale(float(width), float(height))
+def _render_pdf_page(
+    page: Any, 
+    output_path: Path,
+    pdf_width_pts: float,
+    pdf_height_pts: float
+) -> tuple[int, int, float]:
+    """Render PDF page to image at DPI-based scale.
+    
+    Returns: (image_width, image_height, actual_scale)
+    """
+    scale = _calculate_scale_from_dpi(pdf_width_pts, pdf_height_pts)
     bitmap = page.render(scale=scale)
     try:
         image = bitmap.to_pil().convert("RGB")
         output_path.parent.mkdir(parents=True, exist_ok=True)
         image.save(output_path, format="PNG")
-        return image.size
+        return image.size + (scale,)
     finally:
         bitmap.close()
 
 
-def _prepare_pdf(source_path: Path, task_dir: Path) -> list[dict[str, Any]]:
+def _prepare_pdf(source_path: Path, task_dir: Path, force_ocr: bool = False) -> list[dict[str, Any]]:
     try:
         document = pdfium.PdfDocument(str(source_path))
     except pdfium.PdfiumError as exc:
@@ -145,13 +158,18 @@ def _prepare_pdf(source_path: Path, task_dir: Path) -> list[dict[str, Any]]:
                     # Page can still be rendered and fall back to OCR when text layer is unreadable。
                     native_text = ""
 
+                # Get PDF page dimensions in points (PDF native coordinate system)
+                page_width_pts, page_height_pts = page.get_size()
+
                 page_dir = task_dir / "pages" / f"page_{page_index + 1:04d}"
                 original_path = page_dir / "original.png"
-                width, height = _render_pdf_page(page, original_path)
+                image_width, image_height, render_scale = _render_pdf_page(
+                    page, original_path, page_width_pts, page_height_pts
+                )
                 processing_method = (
-                    "native_text"
-                    if should_use_native_pdf_text(native_text)
-                    else "ocr"
+                    "ocr"
+                    if force_ocr or not should_use_native_pdf_text(native_text)
+                    else "native_text"
                 )
                 pages.append(
                     {
@@ -161,8 +179,11 @@ def _prepare_pdf(source_path: Path, task_dir: Path) -> list[dict[str, Any]]:
                         "native_text": (
                             native_text if processing_method == "native_text" else None
                         ),
-                        "width": width,
-                        "height": height,
+                        "width": image_width,
+                        "height": image_height,
+                        "pdf_width_pts": page_width_pts,
+                        "pdf_height_pts": page_height_pts,
+                        "render_scale": render_scale,
                         "preparation_error": None,
                     }
                 )
@@ -211,7 +232,7 @@ def _prepare_image(source_path: Path) -> list[dict[str, Any]]:
     ]
 
 
-def prepare_document_file(source_path: str) -> dict[str, Any]:
+def prepare_document_file(source_path: str, force_ocr: bool = False) -> dict[str, Any]:
     """Prepare an uploaded source file inside a process-pool worker."""
     path = Path(source_path)
     if not path.is_file():
@@ -220,7 +241,7 @@ def prepare_document_file(source_path: str) -> dict[str, Any]:
     file_type = "pdf" if path.suffix.lower() == ".pdf" else "image"
     task_dir = path.parent
     pages = (
-        _prepare_pdf(path, task_dir)
+        _prepare_pdf(path, task_dir, force_ocr)
         if file_type == "pdf"
         else _prepare_image(path)
     )
