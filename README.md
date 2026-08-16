@@ -27,46 +27,74 @@ A Paddle OCR Web API based on `FastAPI`.
 
 ## Azure Document Intelligence Compatibility
 
-The API provides Azure Document Intelligence-compatible endpoints for integration with Paperless-ngx and other systems:
+The API provides Azure Document Intelligence-compatible endpoints for integration with Paperless-ngx and other systems. The wire contract matches the `azure-ai-documentintelligence` 1.0.2 Python SDK (the version Paperless-ngx pins), so both PDFs and images are supported.
 
 ### Endpoints
 
-**POST `/documentintelligence/documentModels/prebuilt-layout:analyze`**
-- Submit PDF for OCR analysis
+**POST `/documentintelligence/documentModels/{model_id}:analyze`**
+- Submit a PDF or image (PNG, JPEG, TIFF, BMP, GIF, WebP) for OCR analysis
+- Request body: JSON `{"base64Source": "<base64>"}` (SDK format) or multipart `file` (legacy)
+- Any `model_id` is accepted (Paperless-ngx sends `prebuilt-read`)
 - Returns `202 Accepted` with `Operation-Location` header
 - Parameters: `api-version` (query parameter, default: `2024-11-30`)
 
 **GET `/documentintelligence/operations/{task_id}`**
 - Poll task status and retrieve results
 - Returns `{"status": "running"}` while processing
-- Returns full Azure-compatible JSON when completed
+- Returns `{"status": "failed", "error": {"code", "message"}}` on failure
+- Returns full Azure-compatible JSON (`analyzeResult` with `content`, `pages`, `stringIndexType`) when completed
+
+**GET `/documentintelligence/documentModels/{model_id}/analyzeResults/{result_id}/pdf`**
+- Download the searchable archive PDF (SDK path; `result_id` equals the task id)
 
 **GET `/documentintelligence/operations/{task_id}/pdf`**
-- Download searchable PDF with embedded text layer
-- Returns PDF binary with selectable text
+- Legacy archive download path, kept for backward compatibility
 
 ### Usage Example
 
 ```bash
-# Submit PDF for analysis
-curl -X POST "http://localhost:8000/documentintelligence/documentModels/prebuilt-layout:analyze?api-version=2024-11-30" \
-  -F "file=@document.pdf"
+# Submit a PDF for analysis (SDK format)
+BASE64=$(base64 -w 0 document.pdf)
+curl -X POST "http://localhost:8000/documentintelligence/documentModels/prebuilt-read:analyze?api-version=2024-11-30" \
+  -H "Content-Type: application/json" \
+  -d "{\"base64Source\": \"$BASE64\"}"
 
 # Poll status
 curl "http://localhost:8000/documentintelligence/operations/{task_id}?api-version=2024-11-30"
 
 # Download searchable PDF
-curl "http://localhost:8000/documentintelligence/operations/{task_id}/pdf" -o output.pdf
+curl "http://localhost:8000/documentintelligence/documentModels/prebuilt-read/analyzeResults/{task_id}/pdf" -o output.pdf
+```
+
+The legacy multipart format also works:
+
+```bash
+curl -X POST "http://localhost:8000/documentintelligence/documentModels/prebuilt-read:analyze?api-version=2024-11-30" \
+  -F "file=@document.pdf"
 ```
 
 ### Paperless-ngx Integration
 
-Configure Paperless-ngx to use the Azure-compatible endpoint:
+Configure Paperless-ngx's remote OCR provider to use the Azure-compatible endpoint:
 
 ```env
-PAPERLESS_OCR_PROVIDER=azure
-PAPERLESS_OCR_AZURE_ENDPOINT=http://your-server:8000
-PAPERLESS_OCR_AZURE_API_VERSION=2024-11-30
+PAPERLESS_REMOTE_OCR_ENGINE=azureai
+PAPERLESS_REMOTE_OCR_ENDPOINT=http://your-server:8000
+PAPERLESS_REMOTE_OCR_API_KEY=unused
+```
+
+The wire contract matches the `azure-ai-documentintelligence==1.0.2` SDK
+exactly (the version Paperless-ngx resolves), including the
+`poller.details["operation_id"]` lookup: the SDK's
+`AnalyzeDocumentLROPoller` parses the last path segment of the
+`Operation-Location` URL, which is this API's task id.
+
+To verify end-to-end with the real SDK (it replays Paperless-ngx's exact
+call sequence):
+
+```bash
+pip install azure-ai-documentintelligence==1.0.2
+python scripts/sdk_smoke_test.py ./test.pdf http://your-server:8000
 ```
 
 ### Force OCR Configuration
@@ -92,13 +120,27 @@ The downloadable PDF (`/documentintelligence/operations/{task_id}/pdf`) contains
 
 ### Test Script
 
-A test script is included to verify the full pipeline:
+A test script is included to verify the full pipeline. It replays the exact
+call sequence the Azure SDK performs (JSON `base64Source` submit, poll,
+`analyzeResults` PDF download) and accepts PDFs and images:
 
 ```bash
 python scripts/analyze_boxes.py ./test.pdf
+python scripts/analyze_boxes.py ./scan.png
 ```
 
-The script submits the PDF, polls for completion, downloads the searchable PDF (saved as `test_ocr.pdf`), and verifies coordinate transformation correctness.
+The script submits the document, polls for completion, downloads the
+searchable PDF (saved as `<name>_ocr.pdf`), and prints the per-page
+box/coordinate analysis.
+
+### Unit Tests
+
+The Azure compatibility layer has a unit test suite that stubs the internal
+PaddleOCR API in-process (no OCR models or running server required):
+
+```bash
+uv run pytest tests/test_azure_api.py
+```
 
 ### OCR Quality Configuration
 

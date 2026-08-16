@@ -645,25 +645,25 @@ def ai_organizer_status() -> dict[str, Any]:
         return {
             "available": False,
             "model_name": model_name,
-            "reason": "未配置 AI_TEXT_MODEL_PATH",
+            "reason": "AI_TEXT_MODEL_PATH is not configured",
         }
     if model_path.suffix.lower() != ".gguf":
         return {
             "available": False,
             "model_name": model_name,
-            "reason": "AI 模型必须是 GGUF 文件",
+            "reason": "AI model must be a GGUF file",
         }
     if not model_path.is_file():
         return {
             "available": False,
             "model_name": model_name,
-            "reason": "配置的 AI 模型文件不存在",
+            "reason": "Configured AI model file does not exist",
         }
     if importlib.util.find_spec("llama_cpp") is None:
         return {
             "available": False,
             "model_name": model_name,
-            "reason": "未安装可选依赖 llama-cpp-python",
+            "reason": "Optional dependency llama-cpp-python is not installed",
         }
     return {
         "available": True,
@@ -701,7 +701,7 @@ def _get_llm() -> Any:
             from llama_cpp import Llama
         except ImportError as exc:
             raise TextOrganizerError(
-                "未安装可选依赖 llama-cpp-python"
+                "Optional dependency llama-cpp-python is not installed"
             ) from exc
 
         kwargs: dict[str, Any] = {
@@ -723,7 +723,7 @@ def _get_llm() -> Any:
         try:
             _llm_instance = Llama(**kwargs)
         except Exception as exc:
-            raise TextOrganizerError(f"AI 模型加载失败：{exc}") from exc
+            raise TextOrganizerError(f"Failed to load AI model: {exc}") from exc
         _llm_signature = signature
         return _llm_instance
 
@@ -824,25 +824,25 @@ def _parse_ai_groups(
     try:
         payload = json.loads(content)
     except json.JSONDecodeError as exc:
-        raise TextOrganizerError("AI 未返回有效 JSON") from exc
+        raise TextOrganizerError("AI did not return valid JSON") from exc
 
     paragraph_ends = (
         payload.get("paragraph_ends") if isinstance(payload, dict) else None
     )
     if not isinstance(paragraph_ends, list) or not paragraph_ends:
-        raise TextOrganizerError("AI 结果缺少 paragraph_ends")
+        raise TextOrganizerError("AI result is missing paragraph_ends")
     if any(
         isinstance(value, bool) or not isinstance(value, int)
         for value in paragraph_ends
     ):
-        raise TextOrganizerError("AI 段落边界编号格式无效")
+        raise TextOrganizerError("AI paragraph boundary ids have an invalid format")
 
     ids = list(expected_ids)
     positions = {value: index for index, value in enumerate(ids)}
     try:
         end_positions = [positions[value] for value in paragraph_ends]
     except KeyError as exc:
-        raise TextOrganizerError("AI 返回了超出范围的段落边界") from exc
+        raise TextOrganizerError("AI returned out-of-range paragraph boundaries") from exc
     if (
         paragraph_ends[-1] != ids[-1]
         or any(
@@ -850,7 +850,9 @@ def _parse_ai_groups(
             for current, following in zip(end_positions, end_positions[1:])
         )
     ):
-        raise TextOrganizerError("AI 段落边界必须严格递增并以末行结束")
+        raise TextOrganizerError(
+            "AI paragraph boundaries must be strictly increasing and end at the last line"
+        )
 
     groups: list[list[int]] = []
     start = 0
@@ -890,9 +892,9 @@ def _organize_chunk_with_ai(
             else choice.get("text")
         )
     except Exception as exc:
-        raise TextOrganizerError(f"AI 推理失败：{exc}") from exc
+        raise TextOrganizerError(f"AI inference failed: {exc}") from exc
     if not isinstance(content, str) or not content.strip():
-        raise TextOrganizerError("AI 未返回整理结果")
+        raise TextOrganizerError("AI did not return an organization result")
 
     groups = _parse_ai_groups(
         _strip_empty_think_prefix(content),
@@ -913,7 +915,7 @@ def _build_ai_page_result(
         page_width=page_width,
     )
     if not lines:
-        raise TextOrganizerError("当前页没有可整理的文字")
+        raise TextOrganizerError("No text to organize on the current page")
     llm = _get_llm()
     groups: list[list[TextLine]] = []
     for chunk in _chunk_lines(lines):
@@ -969,7 +971,7 @@ def _get_boundary_grammar() -> Any:
             from llama_cpp import LlamaGrammar
         except ImportError as exc:
             raise TextOrganizerError(
-                "未安装可选依赖 llama-cpp-python"
+                "Optional dependency llama-cpp-python is not installed"
             ) from exc
         _boundary_grammar = LlamaGrammar.from_string(
             'root ::= "0" | "1"\n',
@@ -984,9 +986,9 @@ def _boundary_probability(response: Any) -> tuple[bool, float]:
         message = choice["message"]
         label = _strip_empty_think_prefix(str(message["content"]))
     except (KeyError, IndexError, TypeError) as exc:
-        raise TextOrganizerError("AI 未返回有效的边界判断") from exc
+        raise TextOrganizerError("AI did not return a valid boundary judgment") from exc
     if label not in {"0", "1"}:
-        raise TextOrganizerError("AI 边界判断不是 0 或 1")
+        raise TextOrganizerError("AI boundary judgment is not 0 or 1")
 
     probabilities: dict[str, float] = {}
     try:
@@ -1038,7 +1040,7 @@ def _judge_boundary_with_ai(
     try:
         response = llm.create_chat_completion(**completion_kwargs)
     except Exception as exc:
-        raise TextOrganizerError(f"AI 边界判断失败：{exc}") from exc
+        raise TextOrganizerError(f"AI boundary judgment failed: {exc}") from exc
     return _boundary_probability(response)
 
 
@@ -1063,7 +1065,7 @@ def _build_ai_boundary_result(
         page_width=page_width,
     )
     if not lines:
-        raise TextOrganizerError("当前页没有可整理的文字")
+        raise TextOrganizerError("No text to organize on the current page")
     rule_result = build_rule_result(
         processing_method,
         native_text,
@@ -1263,9 +1265,9 @@ def build_ai_result(
     )
     if selected_variant is None:
         raise TextOrganizerError(
-            "整页分组与逐边界判断均失败："
-            f"整页={variants['page']['error']}；"
-            f"逐边界={variants['boundary']['error']}"
+            "Both page grouping and boundary judgment failed: "
+            f"page={variants['page']['error']}; "
+            f"boundary={variants['boundary']['error']}"
         )
     primary = dict(variants[selected_variant]["result"])
     primary["method"] = "local_ai_compare"

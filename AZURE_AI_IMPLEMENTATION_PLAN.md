@@ -120,6 +120,83 @@ This document outlines the implementation of an Azure Document Intelligence-comp
 
 ---
 
+### Phase 5: SDK Wire Compatibility (azure-ai-documentintelligence 1.0.2) ✓
+
+**Status**: ✅ COMPLETED
+
+**Background**: The original layer was verified against the exact request contract of
+the `azure-ai-documentintelligence==1.0.2` Python SDK (used by Paperless-ngx's
+`azureai` remote OCR provider; paperless-ngx's `uv.lock` pins it together with
+`azure-core==1.38.0`). The SDK's call sequence is:
+
+1. `POST {endpoint}/documentintelligence/documentModels/prebuilt-read:analyze?api-version=2024-11-30&outputContentFormat=text&output=pdf`
+   with a **JSON** body `{"base64Source": "<base64>"}` (`Content-Type: application/json`)
+2. `GET` the `Operation-Location` URL until `status` is `succeeded`/`failed`
+3. `GET {endpoint}/documentintelligence/documentModels/prebuilt-read/analyzeResults/{result_id}/pdf`
+   where `result_id` is the last path segment of the `Operation-Location` URL
+
+**Changes** (all in `azure_api.py`):
+
+1. **Generic model id**: `POST /documentintelligence/documentModels/{model_id}:analyze`
+   accepts any model id (Paperless-ngx sends `prebuilt-read`; the previous
+   hard-coded `prebuilt-layout` route returned 404 for it)
+2. **JSON `base64Source` body** (SDK format) in addition to the legacy
+   multipart `file` upload
+3. **Magic-byte file type detection** (PDF, PNG, JPEG, TIFF, BMP, GIF, WebP) -
+   the SDK sends no file name, so the type is derived from the content
+4. **New archive route**: `GET /documentintelligence/documentModels/{model_id}/analyzeResults/{result_id}/pdf`
+   (the path the SDK calls; `result_id` == task id). The legacy
+   `GET /documentintelligence/operations/{task_id}/pdf` is kept
+5. **Image input support**: for image tasks the searchable archive PDF is
+   rebuilt from the OCR'd page images (1 pixel == 1 PDF point, so OCR boxes in
+   pixels map 1:1) with the invisible text layer overlaid
+6. **Result fidelity**: `analyzeResult` now includes `stringIndexType:
+   "textElements"`, echoes the requested `modelId`, reports image page
+   dimensions with `unit: "pixel"`, and failed operations return an Azure-style
+   `error: {code, message}` object
+7. **Azure-style error payloads** `{"error": {"code", "message"}}` for 400/404/
+   502 instead of opaque 500s; upstream 4xx/429 from the internal task API are
+   propagated with their status code
+8. **pypdf future-proofing**: pages are attached to a `PdfWriter` before
+   content-stream mutation (mutating reader pages is deprecated in pypdf 6.x
+   and removed in 7.0)
+
+**End-to-end verification with the real SDK**:
+
+Paperless-ngx's `RemoteDocumentParser._azure_ai_vision_parse` reads
+`poller.details["operation_id"]`. This works: `details` is a property of the
+SDK's own `AnalyzeDocumentLROPoller` class (returned by
+`begin_analyze_document`), not of azure-core's base `LROPoller`. It parses
+the last path segment of the `Operation-Location` URL with the regex
+`[^:]+://[^/]+/documentintelligence/.+/([^?/]+)` - which is this API's task
+id. The API was verified end-to-end with the real
+`azure-ai-documentintelligence==1.0.2` client replaying Paperless-ngx's exact
+call sequence (submit -> `poller.wait()` -> `poller.details["operation_id"]`
+-> `poller.result()` -> `get_analyze_result_pdf`): all steps succeed and the
+archive PDF contains the extractable OCR text layer.
+
+To re-verify against a running instance:
+
+```bash
+pip install azure-ai-documentintelligence==1.0.2
+python scripts/sdk_smoke_test.py ./test.pdf http://your-server:8000
+```
+
+**Unit tests**: `tests/test_azure_api.py` (17 tests; the internal PaddleOCR API
+is stubbed in-process, so no OCR models or running server are required):
+
+```bash
+uv run pytest tests/test_azure_api.py
+```
+
+Covered: SDK-format submit (PDF + image), legacy multipart submit, poll
+running/succeeded/failed, `analyzeResult` fidelity (modelId, stringIndexType,
+units, lines), archive PDF via both routes (dimensions + extractable text
+layer), FORCE_OCR text-layer replacement, corrected-variant image fetch, and
+all 400/404 error paths.
+
+---
+
 ## Testing & Validation
 
 ### Step 1: Deploy Feature Branch
@@ -176,17 +253,25 @@ docker compose up -d
 
 ### Step 4: API Testing
 
-#### Test 1: Submit PDF for Analysis
+#### Test 1: Submit PDF for Analysis (SDK format)
 
 ```bash
-curl -X POST "http://localhost:8000/documentintelligence/documentModels/prebuilt-layout:analyze?api-version=2024-11-30" \
-  -H "Content-Type: multipart/form-data" \
-  -F "file=@test-document.pdf"
+BASE64=$(base64 -w 0 test-document.pdf)
+curl -X POST "http://localhost:8000/documentintelligence/documentModels/prebuilt-read:analyze?api-version=2024-11-30" \
+  -H "Content-Type: application/json" \
+  -d "{\"base64Source\": \"$BASE64\"}"
 ```
 
 **Expected Response**: `202 Accepted`
 ```
 Operation-Location: http://localhost:8000/documentintelligence/operations/{task_id}?api-version=2024-11-30
+```
+
+The legacy multipart format also works (any model id):
+
+```bash
+curl -X POST "http://localhost:8000/documentintelligence/documentModels/prebuilt-read:analyze?api-version=2024-11-30" \
+  -F "file=@test-document.pdf"
 ```
 
 #### Test 2: Poll Task Status
@@ -208,7 +293,8 @@ curl "http://localhost:8000/documentintelligence/operations/{task_id}?api-versio
   "lastUpdatedDateTime": "2026-08-08T16:01:00Z",
   "analyzeResult": {
     "apiVersion": "2024-11-30",
-    "modelId": "prebuilt-layout",
+    "modelId": "prebuilt-read",
+    "stringIndexType": "textElements",
     "content": "Full extracted text...",
     "pages": [
       {
@@ -230,6 +316,11 @@ curl "http://localhost:8000/documentintelligence/operations/{task_id}?api-versio
 #### Test 3: Download Searchable PDF
 
 ```bash
+# SDK path (result_id == task_id)
+curl "http://localhost:8000/documentintelligence/documentModels/prebuilt-read/analyzeResults/{task_id}/pdf" \
+  -o output-searchable.pdf
+
+# Legacy path (still supported)
 curl "http://localhost:8000/documentintelligence/operations/{task_id}/pdf" \
   -o output-searchable.pdf
 ```
@@ -304,10 +395,14 @@ PaddleOCRFastAPI/
 │       └── build-test-image.yml          # NEW: CI/CD workflow
 ├── azure_api.py                          # NEW: Azure compatibility layer
 ├── main.py                               # MODIFIED: Added Azure router
-├── pyproject.toml                        # MODIFIED: Added dependencies
+├── pyproject.toml                        # MODIFIED: Added dependencies + pytest config
+├── tests/
+│   └── test_azure_api.py                 # NEW: Unit tests (stubbed PaddleOCR backend)
+├── scripts/
+│   └── analyze_boxes.py                  # MODIFIED: SDK-format submit + image support
 ├── Dockerfile                            # Existing
 ├── docker-compose.yml                    # Existing
-└── README.md                             # Existing
+└── README.md                             # MODIFIED: Updated Azure endpoints
 ```
 
 ---
@@ -317,10 +412,13 @@ PaddleOCRFastAPI/
 ### New Dependencies
 - **reportlab>=4.1.0**: PDF canvas creation for invisible text layers
 - **pypdf>=4.3.0**: PDF manipulation and page merging
+- **httpx>=0.27**: Async HTTP client for internal calls (now a direct dependency)
+
+### Dev Dependencies (`[dependency-groups] dev`, excluded from Docker image via `uv sync --no-dev`)
+- **pytest>=8.0**: Unit test runner for `tests/test_azure_api.py`
 
 ### Existing Dependencies (Used by Azure Layer)
 - **fastapi**: API framework
-- **httpx**: Async HTTP client for internal calls
 - **paddleocr**: Core OCR engine
 - **python-multipart**: Multipart form handling
 
@@ -382,8 +480,7 @@ PaddleOCRFastAPI/
 2. Implement async PDF generation for better performance
 3. Add support for Azure's full response schema (tables, selection marks)
 4. Implement persistent task storage (database-backed)
-5. Add rate limiting for Azure-compatible endpoints
-6. Support for custom model IDs
+5. Enforce the `Authorization: Bearer` key on Azure endpoints (currently accepted but ignored)
 
 ---
 
@@ -401,6 +498,7 @@ PaddleOCRFastAPI/
 | Version | Date | Author | Changes |
 |---------|------|--------|---------|
 | 1.0 | 2026-08-08 | Implementation Team | Initial implementation |
+| 1.1 | 2026-08-15 | Implementation Team | SDK wire compatibility (JSON `base64Source`, generic model id, `analyzeResults` PDF route, image support, `stringIndexType`/`error` fidelity), unit test suite, pypdf future-proofing |
 
 ---
 
